@@ -1,11 +1,22 @@
 import { NextResponse } from 'next/server';
 import pool from '@/lib/db';
 
-export async function GET() {
+export async function GET(request) {
   try {
+    const { searchParams } = new URL(request.url);
+    const userId = searchParams.get('userId');
+
     const client = await pool.connect();
-    // Query events from the database
-    const result = await client.query('SELECT * FROM events ORDER BY start_time ASC');
+    
+    let result;
+    if (userId) {
+      // Filter by user ID to ensure data isolation
+      result = await client.query('SELECT * FROM events WHERE user_id = $1 ORDER BY start_time ASC', [userId]);
+    } else {
+      // If no user ID provided, return no private events (or could return public ones)
+      result = await client.query('SELECT * FROM events WHERE user_id IS NULL ORDER BY start_time ASC');
+    }
+    
     client.release();
     
     // Map the database fields to the CanvasEvent interface used in the frontend
