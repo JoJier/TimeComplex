@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import mammoth from 'mammoth';
+import { PDFParse } from 'pdf-parse';
 
 // MiniMax configuration
 const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
@@ -26,10 +27,10 @@ export async function POST(request) {
       const buffer = Buffer.from(await file.arrayBuffer());
       
       if (file.name.endsWith('.pdf')) {
-        // Dynamic require to bypass Turbopack's static analysis
-        const pdfParser = require('pdf-parse');
-        const data = await pdfParser(buffer);
+        const parser = new PDFParse({ data: buffer });
+        const data = await parser.getText();
         textContent = data.text;
+        await parser.destroy();
       } else if (file.name.endsWith('.docx')) {
         const data = await mammoth.extractRawText({ buffer });
         textContent = data.value;
@@ -95,8 +96,9 @@ export async function POST(request) {
         const parsed = JSON.parse(cleaned);
         events = Array.isArray(parsed) ? parsed : (parsed.events || []);
       }
-    } catch (e) {
+    } catch (err) {
       console.error("JSON Parse Error. AI Response was:", aiResponse);
+      console.error("JSON Parse Error:", err);
       throw new Error("AI 返回格式解析失败，请尝试简化输入内容。");
     }
 

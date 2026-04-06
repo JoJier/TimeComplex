@@ -1,8 +1,8 @@
 "use client";
 
-import { useState, useRef, useEffect, useMemo } from "react";
+import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Search, SlidersHorizontal, List, Globe, Users, User, X, Check, Trash2, Calendar, LogIn, UserPlus, Lock, Mail, Eye, EyeOff, Undo, Sparkles, FileText, Link, Send, Loader2, Upload } from "lucide-react";
+import { Search, SlidersHorizontal, List, Globe, Users, User, X, Check, Trash2, Calendar, LogIn, UserPlus, Lock, Mail, Eye, EyeOff, Undo, Sparkles, FileText, Link, Send, Loader2, Upload, MousePointer2, Square, Circle, StickyNote, Image as ImageIcon } from "lucide-react";
 
 interface CanvasEvent {
   id: string;
@@ -11,6 +11,18 @@ interface CanvasEvent {
   label: string;
   color: string;
 }
+
+interface TimeBlock {
+  id: string;
+  startTime: string;
+  endTime: string;
+  label: string;
+  color: string;
+  category: string;
+  y: number;
+}
+
+type TimelineTick = { type: 'year' | 'month' | 'quarter'; value: number | string; x: number };
 
 // 9 Zoom Levels
 const ZOOM_LEVELS = [
@@ -50,17 +62,37 @@ const INITIAL_EVENTS: CanvasEvent[] = [
   { id: "war-8", time: "2024-04-13", y: 820, label: "伊朗对以色列发动报复性袭击", color: "#f59e0b" },
 ];
 
-// Helper to convert date string to year offset from 2026-01-01
 const dateToOffset = (dateStr: string) => {
-  const date = new Date(dateStr);
-  const diffTime = date.getTime() - BASE_DATE.getTime();
-  return diffTime / (1000 * 60 * 60 * 24 * 365.25);
+  const [yearStr, monthStr, dayStr] = dateStr.split('-');
+  const year = Number(yearStr);
+  const monthIndex = Number(monthStr) - 1;
+  const dayIndex = Number(dayStr) - 1;
+  if (!Number.isFinite(year) || !Number.isFinite(monthIndex) || !Number.isFinite(dayIndex)) return 0;
+
+  const baseYear = BASE_DATE.getFullYear();
+  const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
+  const clampedDayIndex = Math.max(0, Math.min(daysInMonth - 1, dayIndex));
+
+  return (year - baseYear) + monthIndex / 12 + (clampedDayIndex / daysInMonth) / 12;
 };
 
-// Helper to convert year offset back to date string
 const offsetToDate = (offset: number) => {
-  const date = new Date(BASE_DATE.getTime() + offset * (1000 * 60 * 60 * 24 * 365.25));
-  return date.toISOString().split('T')[0];
+  const baseYear = BASE_DATE.getFullYear();
+  const safe = Number.isFinite(offset) ? offset : 0;
+
+  const yearOffset = Math.floor(safe);
+  const year = baseYear + yearOffset;
+  const withinYear = safe - yearOffset;
+  const monthFloat = withinYear * 12;
+  const monthIndex = Math.max(0, Math.min(11, Math.floor(monthFloat)));
+  const withinMonth = monthFloat - monthIndex;
+
+  const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
+  const dayIndex = Math.max(0, Math.min(daysInMonth - 1, Math.floor(withinMonth * daysInMonth)));
+
+  const mm = String(monthIndex + 1).padStart(2, '0');
+  const dd = String(dayIndex + 1).padStart(2, '0');
+  return `${year}-${mm}-${dd}`;
 };
 
 export default function Home() {
@@ -68,14 +100,19 @@ export default function Home() {
   const [offset, setOffset] = useState({ x: 100, y: 50 });
   const [isPanning, setIsPanning] = useState(false);
   const [events, setEvents] = useState<CanvasEvent[]>(INITIAL_EVENTS);
+  const [timeBlocks, setTimeBlocks] = useState<TimeBlock[]>([]);
   const [windowSize, setWindowSize] = useState({ width: 0, height: 0 });
   const containerRef = useRef<HTMLDivElement>(null);
 
   const [editingEventId, setEditingEventId] = useState<string | null>(null);
+  const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
   const [pendingEvent, setPendingEvent] = useState<{ x: number, y: number, time: string } | null>(null);
+  const [pendingBlock, setPendingBlock] = useState<{ startX: number, currentX: number, y: number, startTime: string, endTime: string } | null>(null);
   const [currentLabel, setCurrentLabel] = useState("");
   const [currentTime, setCurrentTime] = useState("");
+  const [currentEndTime, setCurrentTimeEnd] = useState("");
   const [currentColor, setCurrentColor] = useState("#fbbf24");
+  const [currentCategory, setCurrentCategory] = useState("其他");
   
   const [authMode, setAuthMode] = useState<'login' | 'register' | null>(null);
   const [username, setUsername] = useState("");
@@ -88,9 +125,29 @@ export default function Home() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [currentUser, setCurrentUser] = useState<{ id: string, username: string } | null>(null);
   const [loginError, setLoginError] = useState("");
+  const [activeTool, setActiveTool] = useState<'select' | 'block' | 'point' | 'sticker' | 'import' | 'ai' | 'search'>('select');
   const [searchQuery, setSearchQuery] = useState("");
+  const [isSearchExpanded, setIsSearchExpanded] = useState(false);
   const [searchResults, setSearchResults] = useState<CanvasEvent[]>([]);
   const [highlightedEventId, setHighlightedEventId] = useState<string | null>(null);
+
+  const cancelEdit = () => {
+    setPendingEvent(null);
+    setPendingBlock(null);
+    setEditingEventId(null);
+    setEditingBlockId(null);
+    setCurrentLabel("");
+    setCurrentTime("");
+    setCurrentTimeEnd("");
+    setCurrentColor("#fbbf24");
+    setCurrentCategory("其他");
+  };
+
+  const switchTool = (tool: 'select' | 'block' | 'point' | 'sticker' | 'import' | 'ai' | 'search') => {
+    setActiveTool(tool);
+    setIsSearchExpanded(false);
+    cancelEdit(); // 切换工具时强制清除所有编辑/创建状态
+  };
 
   const handleSearch = (query: string) => {
     setSearchQuery(query);
@@ -148,8 +205,7 @@ export default function Home() {
       const data = await res.json();
       
       if (data.events && data.events.length > 0) {
-        // Map data.events to CanvasEvent and show review UI
-        const mapped = data.events.map((ev: any, i: number) => ({
+        const mapped = (data.events as Array<{ time: string; label: string }>).map((ev, i: number) => ({
           id: `ai-${Date.now()}-${i}`,
           time: ev.time,
           label: ev.label,
@@ -256,9 +312,85 @@ export default function Home() {
     return windowSize.width / currentZoom.yearsVisible;
   }, [currentZoom, windowSize.width]);
 
+  const gridSizePx = useMemo(() => {
+    const divisor = currentZoom.tickType === 'month' ? 12 : 4;
+    return pixelsPerYear / divisor;
+  }, [currentZoom.tickType, pixelsPerYear]);
+
+  const snapPxToGrid = useCallback((px: number) => {
+    if (gridSizePx === 0) return px;
+    return Math.round(px / gridSizePx) * gridSizePx;
+  }, [gridSizePx]);
+
+  const snapYearOffsetToGrid = useCallback((yearOffset: number) => {
+    return snapPxToGrid(yearOffset * pixelsPerYear) / pixelsPerYear;
+  }, [pixelsPerYear, snapPxToGrid]);
+
+  const getNextTimeBlockLabel = useCallback(() => {
+    let max = 0;
+    for (const block of timeBlocks) {
+      const match = /^时间(\d+)$/.exec(block.label.trim());
+      if (match) max = Math.max(max, Number(match[1]));
+    }
+    return `时间${max + 1}`;
+  }, [timeBlocks]);
+
+  const getTimeBlockRange = useCallback((block: TimeBlock) => {
+    const a = dateToOffset(block.startTime);
+    const b = dateToOffset(block.endTime);
+    const start = Math.min(a, b);
+    const end = Math.max(a, b);
+    return { start, end };
+  }, []);
+
+  const isOverlappingTimeBlock = useCallback((row: number, start: number, end: number, ignoreId?: string) => {
+    if (!(end > start)) return false;
+    for (const block of timeBlocks) {
+      if (block.y !== row) continue;
+      if (ignoreId && block.id === ignoreId) continue;
+      const r = getTimeBlockRange(block);
+      if (!(r.end > r.start)) continue;
+      if (start < r.end && r.start < end) return true;
+    }
+    return false;
+  }, [getTimeBlockRange, timeBlocks]);
+
+  const findTimeBlockAtCell = useCallback((row: number, yearOffset: number) => {
+    for (const block of timeBlocks) {
+      if (block.y !== row) continue;
+      const r = getTimeBlockRange(block);
+      if (r.start <= yearOffset && yearOffset < r.end) return block;
+    }
+    return null;
+  }, [getTimeBlockRange, timeBlocks]);
+
+  const openTimeBlockEditor = useCallback((block: TimeBlock) => {
+    setEditingBlockId(block.id);
+    setEditingEventId(null);
+    setPendingEvent(null);
+    setPendingBlock({
+      startX: dateToOffset(block.startTime),
+      currentX: dateToOffset(block.endTime),
+      y: block.y,
+      startTime: block.startTime,
+      endTime: block.endTime
+    });
+    setCurrentLabel(block.label);
+    setCurrentTime(block.startTime);
+    setCurrentTimeEnd(block.endTime);
+    setCurrentColor(block.color);
+    setCurrentCategory(block.category);
+  }, []);
+
+  useEffect(() => {
+    if (gridSizePx === 0) return;
+    const maxRow = 5000 / gridSizePx + 2;
+    setTimeBlocks(prev => prev.map(block => (block.y > maxRow ? { ...block, y: Math.round(block.y / gridSizePx) } : block)));
+  }, [gridSizePx]);
+
   const dynamicTimelineTicks = useMemo(() => {
     if (windowSize.width === 0) return [];
-    const ticks = [];
+    const ticks: TimelineTick[] = [];
     const startYearOffset = Math.floor((0 - offset.x) / pixelsPerYear);
     const endYearOffset = Math.ceil((windowSize.width - offset.x) / pixelsPerYear);
     const yearStep = 1;
@@ -409,19 +541,106 @@ export default function Home() {
   };
 
   const handleMouseDown = (e: React.MouseEvent) => {
-    if (e.button === 1 || (e.button === 0 && (e.altKey || e.ctrlKey))) { 
+    if ((e.target as HTMLElement).closest('.editing-popup')) return;
+
+    if (e.button === 1 || (e.button === 0 && (e.altKey || e.ctrlKey)) || activeTool === 'select') { 
       setIsPanning(true);
       e.preventDefault();
+    } else if (e.button === 0 && !pendingEvent && !editingEventId && !editingBlockId && !pendingBlock) {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+
+      const rawYearOffset = (e.clientX - rect.left - offset.x) / pixelsPerYear;
+      const yearOffset = snapYearOffsetToGrid(rawYearOffset);
+      const canvasY = (e.clientY - rect.top - offset.y);
+      const timeStr = offsetToDate(yearOffset);
+
+      if (activeTool === 'block') {
+        const row = gridSizePx === 0 ? 0 : Math.round(canvasY / gridSizePx);
+        const existing = findTimeBlockAtCell(row, yearOffset);
+        if (existing) {
+          openTimeBlockEditor(existing);
+          return;
+        }
+        setCurrentColor("#fbbf24");
+        setCurrentCategory("其他");
+        setPendingBlock({
+          startX: yearOffset,
+          currentX: yearOffset,
+          y: row,
+          startTime: timeStr,
+          endTime: timeStr
+        });
+      }
     }
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
     if (isPanning) {
       setOffset(prev => ({ x: prev.x + e.movementX, y: prev.y + e.movementY }));
+    } else if (pendingBlock && !editingBlockId) {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect) {
+        const rawYearOffset = (e.clientX - rect.left - offset.x) / pixelsPerYear;
+        const yearOffset = snapYearOffsetToGrid(rawYearOffset);
+        const startTime = pendingBlock.startX < yearOffset ? pendingBlock.startTime : offsetToDate(yearOffset);
+        const endTime = pendingBlock.startX < yearOffset ? offsetToDate(yearOffset) : pendingBlock.startTime;
+        
+        setPendingBlock(prev => prev ? {
+          ...prev,
+          currentX: yearOffset,
+          startTime,
+          endTime
+        } : null);
+      }
     }
   };
 
-  const handleMouseUp = () => setIsPanning(false);
+  const handleMouseUp = () => {
+    if (isPanning) {
+      setIsPanning(false);
+    } else if (pendingBlock && activeTool === 'block' && !editingBlockId) {
+      const startTime = pendingBlock.startTime;
+      let endTime = pendingBlock.endTime;
+      if (startTime === endTime) {
+        const end = new Date(startTime);
+        if (currentZoom.tickType === 'month') {
+          end.setMonth(end.getMonth() + 1);
+        } else if (currentZoom.tickType === 'quarter') {
+          end.setMonth(end.getMonth() + 3);
+        } else {
+          end.setFullYear(end.getFullYear() + 1);
+        }
+        endTime = end.toISOString().split('T')[0];
+      }
+
+      const startOffset = dateToOffset(startTime);
+      const endOffset = dateToOffset(endTime);
+      const rangeStart = Math.min(startOffset, endOffset);
+      const rangeEnd = Math.max(startOffset, endOffset);
+      if (isOverlappingTimeBlock(pendingBlock.y, rangeStart, rangeEnd)) {
+        alert('时间块不能重叠');
+        setPendingBlock(null);
+        return;
+      }
+
+      const label = getNextTimeBlockLabel();
+      const newBlock: TimeBlock = {
+        id: Math.random().toString(36).slice(2, 11),
+        startTime,
+        endTime,
+        label,
+        color: currentColor,
+        category: currentCategory,
+        y: pendingBlock.y,
+      };
+      setTimeBlocks(prev => [...prev, newBlock]);
+      setPendingBlock(null);
+      setEditingBlockId(null);
+      setEditingEventId(null);
+      setPendingEvent(null);
+    }
+  };
 
   const handleCanvasClick = (e: React.MouseEvent) => {
     if (isPanning) return;
@@ -429,31 +648,72 @@ export default function Home() {
       setAuthMode(null);
       return;
     }
+
+    // 只有在点或方块模式下才允许通过点击创建
+    if (activeTool !== 'point' && activeTool !== 'block') {
+      if (pendingEvent || editingEventId || pendingBlock || editingBlockId) {
+        cancelEdit();
+      }
+      return;
+    }
+
+    if (e.button === 0 && !e.altKey && !e.ctrlKey && activeTool === 'block') {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect) {
+        const rawYearOffset = (e.clientX - rect.left - offset.x) / pixelsPerYear;
+        const yearOffset = snapYearOffsetToGrid(rawYearOffset);
+        const canvasY = (e.clientY - rect.top - offset.y);
+        const row = gridSizePx === 0 ? 0 : Math.round(canvasY / gridSizePx);
+        const existing = findTimeBlockAtCell(row, yearOffset);
+        if (existing) {
+          openTimeBlockEditor(existing);
+          return;
+        }
+      }
+    }
+
+    if ((e.target as HTMLElement).closest('rect') || (e.target as HTMLElement).closest('circle')) {
+      return;
+    }
+
     if (e.button === 0 && !e.altKey && !e.ctrlKey) {
-      if (pendingEvent || editingEventId) {
+      // 如果当前已经在编辑状态，点击空白处则取消
+      if (pendingEvent || editingEventId || pendingBlock || editingBlockId) {
         cancelEdit();
         return;
       }
+
       const rect = containerRef.current?.getBoundingClientRect();
       if (rect) {
         const yearOffset = (e.clientX - rect.left - offset.x) / pixelsPerYear;
         const canvasY = (e.clientY - rect.top - offset.y);
         const timeStr = offsetToDate(yearOffset);
         
-        setPendingEvent({ x: yearOffset, y: canvasY, time: timeStr });
-        setEditingEventId(null);
-        setCurrentLabel("");
-        setCurrentTime(timeStr);
+        if (activeTool === 'point') {
+          // 初始化点事件创建状态
+          setPendingEvent({ x: yearOffset, y: canvasY, time: timeStr });
+          setEditingEventId(null);
+          setCurrentLabel("新事件");
+          setCurrentTime(timeStr);
+          setCurrentTimeEnd(timeStr);
+          setCurrentColor("#fbbf24");
+          setCurrentCategory("其他");
+        }
+        // 注意：方块模式的初始化主要在 handleMouseDown/Up 中处理
       }
     }
   };
 
   const startEditing = (event: CanvasEvent) => {
+    setEditingBlockId(null);
+    setPendingBlock(null);
     setPendingEvent({ x: dateToOffset(event.time), y: event.y, time: event.time });
     setEditingEventId(event.id);
     setCurrentLabel(event.label);
     setCurrentTime(event.time);
+    setCurrentTimeEnd(event.time);
     setCurrentColor(event.color);
+    setCurrentCategory("其他");
   };
 
   const saveEvent = async () => {
@@ -517,12 +777,70 @@ export default function Home() {
     }
   };
 
-  const cancelEdit = () => {
-    setPendingEvent(null);
-    setEditingEventId(null);
-    setCurrentLabel("");
-    setCurrentTime("");
-    setCurrentColor("#fbbf24");
+  const saveTimeBlock = async () => {
+    if (!currentLabel.trim() || !currentTime || !currentEndTime) {
+      cancelEdit();
+      return;
+    }
+
+    const fallbackRow = Math.round(400 / gridSizePx);
+    const newBlockData = {
+      startTime: currentTime,
+      endTime: currentEndTime,
+      label: currentLabel.trim(),
+      color: currentColor,
+      category: currentCategory,
+      y: editingBlockId ? (timeBlocks.find(b => b.id === editingBlockId)?.y ?? fallbackRow) : (pendingBlock?.y ?? fallbackRow)
+    };
+
+    const startOffset = dateToOffset(newBlockData.startTime);
+    const endOffset = dateToOffset(newBlockData.endTime);
+    const rangeStart = Math.min(startOffset, endOffset);
+    const rangeEnd = Math.max(startOffset, endOffset);
+    if (isOverlappingTimeBlock(newBlockData.y, rangeStart, rangeEnd, editingBlockId ?? undefined)) {
+      alert('时间块不能重叠');
+      return;
+    }
+
+    try {
+      // TODO: 实现后端 API 支持 TimeBlock
+      // const res = await fetch('/api/timeblocks', { ... });
+      
+      if (editingBlockId) {
+        setTimeBlocks(prev => prev.map(b => b.id === editingBlockId ? { ...b, ...newBlockData } : b));
+      } else {
+        const newBlock: TimeBlock = {
+          ...newBlockData,
+          id: Math.random().toString(36).substr(2, 9),
+        };
+        setTimeBlocks(prev => [...prev, newBlock]);
+      }
+    } catch (err) {
+      console.error('Error saving time block:', err);
+    }
+    cancelEdit();
+  };
+
+  const deleteTimeBlock = () => {
+    if (editingBlockId) {
+      setTimeBlocks(prev => prev.filter(b => b.id !== editingBlockId));
+      cancelEdit();
+    }
+  };
+
+  const getDurationText = (start: string, end: string) => {
+    const startDate = new Date(start);
+    const endDate = new Date(end);
+    const diffTime = Math.abs(endDate.getTime() - startDate.getTime());
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    
+    if (diffDays >= 365) {
+      return `${(diffDays / 365.25).toFixed(1)} 年`;
+    } else if (diffDays >= 30) {
+      return `${(diffDays / 30.44).toFixed(1)} 月`;
+    } else {
+      return `${diffDays} 天`;
+    }
   };
 
   return (
@@ -542,17 +860,18 @@ export default function Home() {
         <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] bg-blue-200/20 blur-[120px] rounded-full" />
       </div>
 
-      {/* Red vertical "Now" line */}
-      <div className="fixed top-0 bottom-0 w-[2px] bg-red-500/40 z-20 pointer-events-none shadow-[0_0_15px_rgba(239,68,68,0.4)]" style={{ left: offset.x + dateToOffset("2026-03-31") * pixelsPerYear }}>
+      {/* Red vertical "Now" line - Hidden as per user request */}
+      {/* <div className="fixed top-0 bottom-0 w-[2px] bg-red-500/40 z-20 pointer-events-none shadow-[0_0_15px_rgba(239,68,68,0.4)]" style={{ left: offset.x + dateToOffset("2026-03-31") * pixelsPerYear }}>
         <div className="absolute top-36 -left-12 w-24 text-center">
           <span className="text-[10px] font-black text-red-600/50 tracking-widest uppercase bg-white/40 px-2 py-0.5 rounded-full backdrop-blur-sm">Present</span>
         </div>
-      </div>
+      </div> */}
       
       <div className="absolute inset-0 z-10 origin-top-left will-change-transform" style={{ transform: `translate(${offset.x}px, ${offset.y}px)` }}>
         <div className="absolute inset-[-40000px] pointer-events-none" style={{
           backgroundImage: `linear-gradient(to right, rgba(0,0,0,0.04) 1px, transparent 1px), linear-gradient(to bottom, rgba(0,0,0,0.04) 1px, transparent 1px)`,
-          backgroundSize: `${pixelsPerYear / (currentZoom.tickType === 'month' ? 12 : 4)}px 100px`,
+          backgroundSize: `${gridSizePx}px ${gridSizePx}px`,
+          backgroundPosition: `40000px 40000px`,
         }} />
 
         <div className="relative w-[40000px] h-[5000px]">
@@ -565,50 +884,150 @@ export default function Home() {
               <filter id="glow-sm"><feGaussianBlur stdDeviation="3" result="blur" /><feComposite in="SourceGraphic" in2="blur" operator="over" /></filter>
             </defs>
 
-            <motion.path d={`M ${-1 * pixelsPerYear},400 C ${0 * pixelsPerYear},400 ${1 * pixelsPerYear},450 ${2 * pixelsPerYear},550 S ${4 * pixelsPerYear},650 ${7 * pixelsPerYear},650`} stroke="url(#grad-yellow)" strokeWidth="32" fill="none" strokeLinecap="round" />
+            {/* Background curves - Hidden as per user request */}
+            {/* <motion.path d={`M ${-1 * pixelsPerYear},400 C ${0 * pixelsPerYear},400 ${1 * pixelsPerYear},450 ${2 * pixelsPerYear},550 S ${4 * pixelsPerYear},650 ${7 * pixelsPerYear},650`} stroke="url(#grad-yellow)" strokeWidth="32" fill="none" strokeLinecap="round" />
             <motion.path d={`M ${-0.5 * pixelsPerYear},800 C 1 * pixelsPerYear,800 ${3 * pixelsPerYear},880 ${5 * pixelsPerYear},950 S ${7 * pixelsPerYear},1050 ${9 * pixelsPerYear},1050`} stroke="url(#grad-purple)" strokeWidth="32" fill="none" strokeLinecap="round" />
-            <motion.path d={`M ${0 * pixelsPerYear},1200 C 2 * pixelsPerYear,1200 ${5 * pixelsPerYear},1300 ${8 * pixelsPerYear},1380 S ${11 * pixelsPerYear},1500 ${14 * pixelsPerYear},1500`} stroke="url(#grad-teal)" strokeWidth="32" fill="none" strokeLinecap="round" />
+            <motion.path d={`M ${0 * pixelsPerYear},1200 C 2 * pixelsPerYear,1200 ${5 * pixelsPerYear},1300 ${8 * pixelsPerYear},1380 S ${11 * pixelsPerYear},1500 ${14 * pixelsPerYear},1500`} stroke="url(#grad-teal)" strokeWidth="32" fill="none" strokeLinecap="round" /> */}
 
             <g className="pointer-events-auto">
               <AnimatePresence>
-                {events.map(event => (
-                  <Marker 
-                    key={event.id} 
-                    x={dateToOffset(event.time) * pixelsPerYear} 
-                    y={event.y} 
-                    color={event.color} 
-                    label={event.label} 
-                    onClick={() => startEditing(event)} 
-                    isEditing={editingEventId === event.id}
-                    isHighlighted={highlightedEventId === event.id}
+                {/* 渲染已有的 TimeBlocks */}
+                {timeBlocks.map(block => (
+                  <motion.rect
+                    key={block.id}
+                    x={dateToOffset(block.startTime) * pixelsPerYear}
+                    y={block.y * gridSizePx}
+                    width={(dateToOffset(block.endTime) - dateToOffset(block.startTime)) * pixelsPerYear}
+                    height={gridSizePx}
+                    fill={block.color}
+                    fillOpacity="0.2"
+                    stroke={block.color}
+                    strokeWidth="2"
+                    rx="8"
+                    initial={{ opacity: 0, scale: 0.9 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    whileHover={{ fillOpacity: 0.3 }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      openTimeBlockEditor(block);
+                    }}
+                    style={{ cursor: 'pointer' }}
                   />
                 ))}
+
+                {/* 渲染正在拖拽创建的 TimeBlock 预览 */}
+                {pendingBlock && (
+                  <g>
+                    <rect
+                      x={Math.min(pendingBlock.startX, pendingBlock.currentX) * pixelsPerYear}
+                      y={pendingBlock.y * gridSizePx}
+                      width={Math.abs(pendingBlock.currentX - pendingBlock.startX) * pixelsPerYear}
+                      height={gridSizePx}
+                      fill={currentColor}
+                      fillOpacity="0.3"
+                      stroke={currentColor}
+                      strokeWidth="2"
+                      strokeDasharray="4 2"
+                      rx="8"
+                    />
+                    {/* 时间提示条 */}
+                    <foreignObject 
+                      x={Math.min(pendingBlock.startX, pendingBlock.currentX) * pixelsPerYear} 
+                      y={pendingBlock.y * gridSizePx - 45} 
+                      width="300" 
+                      height="40"
+                    >
+                      <div className="flex justify-center w-full">
+                        <div className="glass px-3 py-1.5 rounded-full text-[10px] font-bold text-slate-700 whitespace-nowrap shadow-sm border border-white/60 flex items-center gap-2">
+                          <Calendar className="w-3 h-3 text-blue-500" />
+                          <span>{pendingBlock.startTime} 至 {pendingBlock.endTime}</span>
+                          <span className="bg-blue-100 text-blue-600 px-1.5 py-0.5 rounded-md">
+                            共 {getDurationText(pendingBlock.startTime, pendingBlock.endTime)}
+                          </span>
+                        </div>
+                      </div>
+                    </foreignObject>
+                  </g>
+                )}
               </AnimatePresence>
 
               <AnimatePresence>
-                {pendingEvent && (
+                {(pendingEvent || (pendingBlock && currentTime && !isPanning)) && (
                   <motion.g initial={{ opacity: 0, scale: 0.8 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.8 }} className="pointer-events-auto">
-                    {!editingEventId && <circle cx={dateToOffset(currentTime) * pixelsPerYear} cy={pendingEvent.y} r="8" fill="#cbd5e1" />}
-                    <foreignObject x={dateToOffset(currentTime) * pixelsPerYear - 140} y={pendingEvent.y + 15} width="280" height="150">
-                      <div className="flex flex-col items-center p-1" onClick={e => e.stopPropagation()}>
-                        <div className="glass px-3 py-3 rounded-2xl border border-white/60 shadow-xl flex flex-col gap-3 w-full">
-                          <div className="flex items-center gap-2 bg-white/30 rounded-lg px-2 py-1.5 border border-white/40">
-                            <Calendar className="w-3.5 h-3.5 text-slate-500" />
-                            <input type="date" value={currentTime} onChange={e => setCurrentTime(e.target.value)} className="bg-transparent border-none outline-none text-[11px] font-medium text-slate-700 w-full" />
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <input 
-                              type="color" 
-                              value={currentColor} 
-                              onChange={e => setCurrentColor(e.target.value)}
-                              className="w-6 h-6 rounded-lg overflow-hidden border-none bg-transparent cursor-pointer"
-                            />
-                            <input autoFocus type="text" value={currentLabel} onChange={e => setCurrentLabel(e.target.value)} onKeyDown={e => e.key === 'Enter' ? saveEvent() : e.key === 'Escape' ? cancelEdit() : null} placeholder={editingEventId ? "编辑事件..." : "新事件..."} className="bg-transparent border-none outline-none text-[12px] font-medium text-slate-700 flex-1 px-1" />
-                            <div className="flex items-center gap-1.5 border-l border-slate-100 pl-2">
-                              <button onClick={saveEvent} className="p-1.5 hover:bg-green-100 rounded-lg text-green-600 transition-colors"><Check className="w-3.5 h-3.5" /></button>
-                              {editingEventId && <button onClick={deleteEvent} className="p-1.5 hover:bg-red-100 rounded-lg text-red-500 transition-colors"><Trash2 className="w-3.5 h-3.5" /></button>}
-                              <button onClick={cancelEdit} className="p-1.5 hover:bg-slate-100 rounded-lg text-slate-400 transition-colors"><X className="w-3.5 h-3.5" /></button>
+                    {/* 只有在纯点事件时显示圆圈 */}
+                    {pendingEvent && !editingEventId && currentTime && <circle cx={dateToOffset(currentTime) * pixelsPerYear} cy={pendingEvent.y} r="8" fill="#cbd5e1" />}
+                    
+                    <foreignObject 
+                      x={(currentTime ? dateToOffset(currentTime) : 0) * pixelsPerYear - 140} 
+                      y={(pendingEvent?.y ?? (pendingBlock ? pendingBlock.y * gridSizePx : 400)) + 25} 
+                      width="280" 
+                      height="320"
+                    >
+                      <div className="flex flex-col items-center p-1 editing-popup" onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} onMouseUp={e => e.stopPropagation()}>
+                        <div className="glass px-4 py-4 rounded-3xl border border-white/60 shadow-2xl flex flex-col gap-4 w-full">
+                          <div className="flex items-center justify-between">
+                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                              {editingBlockId || (pendingBlock && activeTool === 'block') ? "时间方块" : "点事件"}
+                            </span>
+                            <div className="flex gap-1">
+                              {["#fbbf24", "#c084fc", "#2dd4bf", "#ef4444", "#3b82f6"].map(c => (
+                                <button key={c} onClick={() => setCurrentColor(c)} className={`w-3.5 h-3.5 rounded-full transition-transform hover:scale-110 ${currentColor === c ? 'ring-2 ring-offset-1 ring-slate-400 scale-110' : ''}`} style={{ backgroundColor: c }} />
+                              ))}
                             </div>
+                          </div>
+
+                          <input 
+                            autoFocus 
+                            type="text" 
+                            value={currentLabel} 
+                            onChange={e => setCurrentLabel(e.target.value)} 
+                            onKeyDown={e => e.key === 'Enter' && (editingBlockId || pendingBlock ? saveTimeBlock() : saveEvent())}
+                            placeholder="输入标题..." 
+                            className="bg-transparent border-none outline-none text-lg font-bold text-slate-700 w-full placeholder:text-slate-300" 
+                          />
+
+                          <div className="flex flex-col gap-2">
+                            <div className="flex items-center gap-2 bg-white/30 rounded-xl px-3 py-2 border border-white/40">
+                              <Calendar className="w-3.5 h-3.5 text-slate-500" />
+                              <input type="date" value={currentTime} onChange={e => setCurrentTime(e.target.value)} className="bg-transparent border-none outline-none text-[11px] font-medium text-slate-700 w-full" />
+                            </div>
+                            
+                            {(editingBlockId || (pendingBlock && activeTool === 'block')) && (
+                              <div className="flex items-center gap-2 bg-white/30 rounded-xl px-3 py-2 border border-white/40 animate-in fade-in slide-in-from-top-1">
+                                <Calendar className="w-3.5 h-3.5 text-slate-500" />
+                                <input type="date" value={currentEndTime} onChange={e => setCurrentTimeEnd(e.target.value)} className="bg-transparent border-none outline-none text-[11px] font-medium text-slate-700 w-full" />
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="flex flex-wrap gap-1.5 py-1">
+                            {["运动", "职业", "旅行", "健康", "学习", "财务", "社交"].map(cat => (
+                              <button 
+                                key={cat} 
+                                onClick={() => setCurrentCategory(cat)}
+                                className={`px-2.5 py-1 rounded-lg text-[10px] transition-all ${currentCategory === cat ? 'bg-slate-800 text-white shadow-md' : 'bg-white/40 text-slate-500 hover:bg-white/60'}`}
+                              >
+                                {cat}
+                              </button>
+                            ))}
+                          </div>
+
+                          <div className="flex items-center gap-2 pt-2 border-t border-slate-100">
+                            <button 
+                              onClick={editingBlockId || (pendingBlock && activeTool === 'block') ? saveTimeBlock : saveEvent} 
+                              className="flex-1 bg-slate-800 text-white py-2.5 rounded-xl text-xs font-bold hover:bg-slate-700 transition-all flex items-center justify-center gap-2 shadow-lg shadow-slate-200"
+                            >
+                              <Check className="w-4 h-4 text-blue-300" /> 
+                              {(editingEventId || editingBlockId) ? "保存修改" : "完成创建"}
+                            </button>
+                            {(editingEventId || editingBlockId) && (
+                              <button onClick={editingBlockId ? deleteTimeBlock : deleteEvent} className="p-2.5 hover:bg-red-50 rounded-xl text-red-500 transition-colors" title="删除">
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            )}
+                            <button onClick={cancelEdit} className="p-2.5 hover:bg-slate-50 rounded-xl text-slate-400 transition-colors" title="取消">
+                              <X className="w-4 h-4" />
+                            </button>
                           </div>
                         </div>
                       </div>
@@ -622,42 +1041,37 @@ export default function Home() {
       </div>
 
       <div className="fixed inset-0 pointer-events-none z-50">
-        <div className="absolute top-10 left-10 pointer-events-auto" onClick={e => e.stopPropagation()}>
+        <div className="absolute top-10 left-10 pointer-events-auto" onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} onMouseUp={e => e.stopPropagation()}>
           <h1 className="text-3xl font-light tracking-wider text-slate-900/80 leading-tight">时间集合体<span className="block text-xl font-extralight opacity-40 mt-1">Time Complex</span></h1>
         </div>
 
         {/* Top Dynamic Multi-level Timeline */}
-        <div className="absolute top-9 left-[280px] right-10 h-20 pointer-events-none flex items-start justify-center">
-          <div className="glass rounded-2xl shadow-sm border border-white/40 pointer-events-auto w-full h-full relative overflow-hidden" onClick={e => e.stopPropagation()}>
-            <div className="absolute inset-0 pt-2">
-              {dynamicTimelineTicks.map((tick: any, i: number) => {
-                // Adjust tick.x to be relative to this container
-                // container is now offset from left by 280px
-                const relativeX = tick.x - 280;
+        <div className="absolute top-4 left-0 right-0 h-20 pointer-events-none">
+          <div className="relative w-full h-full">
+            {dynamicTimelineTicks.map((tick: TimelineTick, i: number) => {
+              const x = tick.x;
 
-                return (
-                  <div key={`${tick.type}-${tick.value}-${i}`} className="absolute flex flex-col items-center top-1/2 -translate-y-1/2" style={{ left: relativeX, transform: 'translate(-50%, -50%)' }}>
-                    {tick.type === 'year' ? (
-                      <>
-                        <span className="text-[12px] font-black text-slate-700 mb-1">{tick.value}</span>
-                        <div className={`w-3.5 h-3.5 rotate-45 border-2 ${tick.value === 2026 ? 'border-red-500 bg-red-100 shadow-[0_0_10px_rgba(239,68,68,0.5)] scale-125' : (typeof tick.value === 'number' && tick.value % 2 === 0 ? 'border-blue-400 bg-blue-50' : 'border-slate-300 bg-slate-50')}`} />
-                      </>
-                    ) : (
-                      <>
-                        <span className="text-[9px] font-bold text-slate-500 mb-0.5">{tick.value}</span>
-                        <div className={`rounded-full bg-slate-300 ${tick.type === 'quarter' ? 'w-1.5 h-1.5' : 'w-1 h-1'}`} />
-                      </>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-            <div className="absolute inset-y-0 left-0 w-32 bg-gradient-to-r from-[#fdf2f8]/90 via-[#fdf2f8]/50 to-transparent z-10 pointer-events-none" />
-            <div className="absolute inset-y-0 right-0 w-32 bg-gradient-to-l from-[#fdf2f8]/90 via-[#fdf2f8]/50 to-transparent z-10 pointer-events-none" />
+              return (
+                <div key={`${tick.type}-${tick.value}-${i}`} className="absolute flex flex-col items-center" style={{ left: x, transform: 'translateX(-50%)' }}>
+                  {tick.type === 'year' ? (
+                    <>
+                      <span className="text-[12px] font-black text-slate-700/80 mb-1">{tick.value}</span>
+                      <div className={`w-3 h-3 rotate-45 border-2 ${tick.value === 2026 ? 'border-red-500 bg-red-100 shadow-[0_0_10px_rgba(239,68,68,0.5)] scale-125' : (typeof tick.value === 'number' && tick.value % 2 === 0 ? 'border-blue-400/60 bg-blue-50/50' : 'border-slate-300/60 bg-slate-50/50')}`} />
+                    </>
+                  ) : (
+                    <>
+                      <span className="text-[9px] font-bold text-slate-500/60 mb-0.5">{tick.value}</span>
+                      <div className={`rounded-full bg-slate-300/40 ${tick.type === 'quarter' ? 'w-1.5 h-1.5' : 'w-1 h-1'}`} />
+                    </>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </div>
 
-        <aside className="absolute left-10 top-40 flex flex-col gap-10 pointer-events-auto" onClick={e => e.stopPropagation()}>
+        {/* 隐藏左侧分类菜单 */}
+        {/* <aside className="absolute left-10 top-40 flex flex-col gap-10 pointer-events-auto" onClick={e => e.stopPropagation()}>
           {[
             { title: "Career", items: ["Career", "Money", "Skills", "Travels", "Hobbies", "Creations"], color: "text-amber-600/70" },
             { title: "Relationship", items: ["Family", "Friends"], color: "text-purple-600/70" },
@@ -665,9 +1079,9 @@ export default function Home() {
           ].map((section) => (
             <section key={section.title}><h2 className={`text-xl font-medium ${section.color} mb-3`}>{section.title}</h2><ul className="space-y-1.5 pl-1">{section.items.map(item => <li key={item} className="cursor-pointer text-slate-400 hover:text-slate-800 transition-colors"><span className="text-base font-light">{item}</span></li>)}</ul></section>
           ))}
-        </aside>
+        </aside> */}
 
-        <div className="absolute right-12 top-10 flex items-center gap-4 pointer-events-auto" onClick={e => e.stopPropagation()}>
+        <div className="absolute right-12 top-10 flex items-center gap-4 pointer-events-auto" onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} onMouseUp={e => e.stopPropagation()}>
            {isLoggedIn ? (
              <div className="flex items-center gap-4">
                <div className="flex items-center gap-2 px-4 py-2 rounded-full glass border border-white/60 text-slate-700 text-sm font-medium">
@@ -707,81 +1121,146 @@ export default function Home() {
            )}
          </div>
 
-        <div className="absolute bottom-12 left-1/2 -translate-x-1/2 w-[60%] max-w-4xl pointer-events-auto" onClick={e => e.stopPropagation()}>
-          <AnimatePresence>
-            {searchResults.length > 0 && (
-              <motion.div 
-                initial={{ opacity: 0, y: 10, scale: 0.95 }}
-                animate={{ opacity: 1, y: 0, scale: 1 }}
-                exit={{ opacity: 0, y: 10, scale: 0.95 }}
-                className="glass absolute bottom-full mb-6 w-full max-h-[300px] overflow-y-auto rounded-3xl border border-white/60 shadow-2xl p-4 flex flex-col gap-2 custom-scrollbar"
-              >
-                {searchResults.map(ev => (
-                  <motion.button
-                    key={ev.id}
-                    whileHover={{ x: 5, backgroundColor: "rgba(255, 255, 255, 0.5)" }}
-                    onClick={() => scrollToEvent(ev)}
-                    className="flex items-center justify-between p-3 rounded-2xl transition-all text-left group"
-                  >
-                    <div className="flex flex-col">
-                      <span className="text-sm font-semibold text-slate-700 group-hover:text-blue-600 transition-colors">{ev.label}</span>
-                      <span className="text-[10px] text-slate-400 font-mono mt-0.5">{ev.time}</span>
-                    </div>
-                    <div className="w-2.5 h-2.5 rounded-full shadow-sm" style={{ backgroundColor: ev.color }} />
-                  </motion.button>
-                ))}
-              </motion.div>
-            )}
-          </AnimatePresence>
+        <div className="fixed bottom-10 left-1/2 -translate-x-1/2 z-[100] pointer-events-auto" onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} onMouseUp={e => e.stopPropagation()}>
+          <div className="glass px-3 py-3 rounded-3xl border border-white/60 shadow-2xl flex items-center gap-2">
+            {/* 0. 选中模式 */}
+            <motion.button 
+              whileHover={{ scale: 1.05, y: -2 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={() => switchTool('select')}
+              className={`group relative p-3.5 rounded-2xl transition-all flex items-center justify-center ${activeTool === 'select' ? 'bg-slate-800 text-white shadow-lg' : 'text-slate-500 hover:bg-white/50'}`}
+            >
+              <MousePointer2 className="w-6 h-6" />
+              <span className="absolute -top-10 left-1/2 -translate-x-1/2 px-2 py-1 bg-slate-800 text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none shadow-xl">选中模式</span>
+            </motion.button>
 
-          <AnimatePresence>
-            {undoStack.length > 0 && (
-              <motion.div 
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: 10 }}
-                className="flex justify-center mb-4"
-              >
-                  <button 
-                    onClick={handleUndo}
-                    className="glass px-4 py-2 rounded-full flex items-center gap-2 text-xs font-medium text-slate-600 hover:bg-white/80 hover:text-blue-600 transition-all shadow-sm border border-white/60"
-                  >
-                    <Undo className="w-3.5 h-3.5" />
-                    撤销删除 ({isMac ? '⌘Z' : 'Ctrl+Z'} - {undoStack.length})
-                  </button>
-              </motion.div>
-            )}
-          </AnimatePresence>
-          <div className="glass px-8 py-5 rounded-[2.5rem] flex items-center gap-5 shadow-2xl border border-white/60">
-              <Search className="w-7 h-7 text-slate-300" />
-              <input 
-                type="text" 
-                value={searchQuery}
-                onChange={e => handleSearch(e.target.value)}
-                onKeyDown={e => {
-                  if (e.key === 'Enter' && searchResults.length > 0) {
-                    scrollToEvent(searchResults[0]);
-                  }
-                }}
-                placeholder="Explore the infinite timeline..." 
-                className="flex-1 bg-transparent border-none outline-none text-slate-700 text-xl font-light placeholder:text-slate-300" 
-              />
-              <div className="flex items-center gap-8 text-slate-300 border-l border-slate-100 pl-8 ml-2">
-                <SlidersHorizontal className="w-6 h-6 cursor-pointer hover:text-blue-500" />
-                <List className="w-6 h-6 cursor-pointer hover:text-blue-500" />
-                <motion.button
-                  whileHover={{ scale: 1.1, rotate: 10 }}
-                  whileTap={{ scale: 0.9 }}
-                  onClick={() => setShowAiModal(true)}
-                  className="p-2 rounded-xl bg-gradient-to-br from-purple-500 to-pink-500 text-white shadow-lg shadow-purple-200/50"
+            {/* 1. 创建时间方块 */}
+            <motion.button 
+              whileHover={{ scale: 1.05, y: -2 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={() => switchTool('block')}
+              className={`group relative p-3.5 rounded-2xl transition-all flex items-center justify-center ${activeTool === 'block' ? 'bg-slate-800 text-white shadow-lg' : 'text-slate-500 hover:bg-white/50'}`}
+            >
+              <Square className="w-6 h-6" />
+              <span className="absolute -top-10 left-1/2 -translate-x-1/2 px-2 py-1 bg-slate-800 text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none shadow-xl">时间方块</span>
+            </motion.button>
+
+            {/* 2. 创建事件点 */}
+            <motion.button 
+              whileHover={{ scale: 1.05, y: -2 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={() => switchTool('point')}
+              className={`group relative p-3.5 rounded-2xl transition-all flex items-center justify-center ${activeTool === 'point' ? 'bg-slate-800 text-white shadow-lg' : 'text-slate-500 hover:bg-white/50'}`}
+            >
+              <Circle className="w-6 h-6" />
+              <span className="absolute -top-10 left-1/2 -translate-x-1/2 px-2 py-1 bg-slate-800 text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none shadow-xl">事件点</span>
+            </motion.button>
+
+            {/* 3. 标签贴纸 */}
+            <motion.button 
+              whileHover={{ scale: 1.05, y: -2 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={() => switchTool('sticker')}
+              className={`group relative p-3.5 rounded-2xl transition-all flex items-center justify-center ${activeTool === 'sticker' ? 'bg-slate-800 text-white shadow-lg' : 'text-slate-500 hover:bg-white/50'}`}
+            >
+              <StickyNote className="w-6 h-6" />
+              <span className="absolute -top-10 left-1/2 -translate-x-1/2 px-2 py-1 bg-slate-800 text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none shadow-xl">标签贴纸</span>
+            </motion.button>
+
+            {/* 4. 导入素材 */}
+            <motion.button 
+              whileHover={{ scale: 1.05, y: -2 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={() => switchTool('import')}
+              className={`group relative p-3.5 rounded-2xl transition-all flex items-center justify-center ${activeTool === 'import' ? 'bg-slate-800 text-white shadow-lg' : 'text-slate-500 hover:bg-white/50'}`}
+            >
+              <Upload className="w-6 h-6" />
+              <span className="absolute -top-10 left-1/2 -translate-x-1/2 px-2 py-1 bg-slate-800 text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none shadow-xl">导入素材</span>
+            </motion.button>
+
+            {/* 5. AI 智能提取 */}
+            <motion.button 
+              whileHover={{ scale: 1.05, y: -2 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={() => { switchTool('ai'); setShowAiModal(true); }}
+              className={`group relative p-3.5 rounded-2xl transition-all flex items-center justify-center ${activeTool === 'ai' ? 'bg-slate-800 text-white shadow-lg' : 'text-slate-500 hover:bg-white/50'}`}
+            >
+              <Sparkles className="w-6 h-6" />
+              <span className="absolute -top-10 left-1/2 -translate-x-1/2 px-2 py-1 bg-slate-800 text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none shadow-xl">AI 提取</span>
+            </motion.button>
+
+            <div className="w-[1px] h-10 bg-slate-200/50 mx-2" />
+
+            {/* 6. 搜索定位 */}
+            <motion.div 
+              layout
+              className={`flex items-center glass-pill transition-all duration-300 ${isSearchExpanded ? 'w-64 px-4 bg-white/40' : 'w-16 justify-center'}`}
+            >
+              <button 
+                  onClick={() => switchTool('search')}
+                  className={`group relative p-3.5 rounded-2xl transition-all flex items-center justify-center ${activeTool === 'search' ? 'bg-slate-800 text-white shadow-lg' : 'text-slate-500 hover:bg-white/50'}`}
                 >
-                  <Sparkles className="w-5 h-5" />
-                </motion.button>
-              </div>
+                  <Search className="w-6 h-6" />
+                  {!isSearchExpanded && <span className="absolute -top-10 left-1/2 -translate-x-1/2 px-2 py-1 bg-slate-800 text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none shadow-xl">搜索定位</span>}
+                </button>
+                
+                <AnimatePresence>
+                  {isSearchExpanded && (
+                    <motion.div
+                      initial={{ width: 0, opacity: 0 }}
+                      animate={{ width: '100%', opacity: 1 }}
+                      exit={{ width: 0, opacity: 0 }}
+                      className="flex items-center ml-3 overflow-hidden"
+                    >
+                      <input
+                        autoFocus
+                        type="text"
+                        placeholder="搜索..."
+                        value={searchQuery}
+                        onChange={(e) => handleSearch(e.target.value)}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter' && searchResults.length > 0) {
+                            scrollToEvent(searchResults[0]);
+                          }
+                        }}
+                        className="bg-transparent border-none outline-none text-sm font-bold text-slate-700 w-full placeholder:text-slate-400"
+                      />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </motion.div>
             </div>
-        </div>
 
-        <div className="absolute bottom-10 right-10 bg-white/60 backdrop-blur-xl px-5 py-2.5 rounded-full text-xs text-slate-500 border border-white/80 shadow-sm select-none"><span className="font-bold text-blue-600 mr-2">Level {currentZoom.level}</span><span className="font-medium text-slate-800">滚轮</span> 切换层级 • <span className="font-medium text-slate-800 ml-2">拖拽</span> 平移 • <span className="ml-2 font-mono">View: {currentZoom.yearsVisible}Y</span></div>
+            {/* 搜索结果弹窗 */}
+            <AnimatePresence>
+              {searchResults.length > 0 && isSearchExpanded && (
+                <motion.div 
+                  initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                  className="glass absolute bottom-full mb-6 w-72 right-0 overflow-y-auto rounded-3xl border border-white/60 shadow-2xl p-4 flex flex-col gap-2 custom-scrollbar"
+                >
+                  <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-2 mb-1">搜索结果 ({searchResults.length})</div>
+                  {searchResults.map(ev => (
+                    <motion.button
+                      key={ev.id}
+                      whileHover={{ x: 5, backgroundColor: "rgba(255, 255, 255, 0.5)" }}
+                      onClick={() => scrollToEvent(ev)}
+                      className="flex items-center justify-between p-3 rounded-2xl transition-all text-left group"
+                    >
+                      <div className="flex flex-col">
+                        <span className="text-sm font-semibold text-slate-700 group-hover:text-blue-600 transition-colors">{ev.label}</span>
+                        <span className="text-[10px] text-slate-400 font-mono mt-0.5">{ev.time}</span>
+                      </div>
+                      <div className="w-2.5 h-2.5 rounded-full shadow-sm" style={{ backgroundColor: ev.color }} />
+                    </motion.button>
+                  ))}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
+        <div className="absolute bottom-12 right-10 bg-white/60 backdrop-blur-xl px-5 py-2.5 rounded-full text-xs text-slate-500 border border-white/80 shadow-sm select-none pointer-events-auto"><span className="font-bold text-blue-600 mr-2">Level {currentZoom.level}</span><span className="font-medium text-slate-800">滚轮</span> 切换层级 • <span className="font-medium text-slate-800 ml-2">拖拽</span> 平移 • <span className="ml-2 font-mono">View: {currentZoom.yearsVisible}Y</span></div>
 
         {/* Auth Modal */}
         <AnimatePresence>
@@ -989,14 +1468,14 @@ export default function Home() {
                 ) : (
                   <div className="space-y-6">
                     <div className="flex p-1 bg-slate-100 rounded-2xl">
-                      {[
+                      {([
                         { id: 'text', icon: FileText, label: '粘贴文本' },
                         { id: 'file', icon: Upload, label: '上传文件' },
                         { id: 'url', icon: Link, label: '网页链接' }
-                      ].map(tab => (
+                      ] as const).map(tab => (
                         <button
                           key={tab.id}
-                          onClick={() => setAiInputType(tab.id as any)}
+                          onClick={() => setAiInputType(tab.id)}
                           className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl text-sm font-medium transition-all ${aiInputType === tab.id ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
                         >
                           <tab.icon className="w-4 h-4" />
