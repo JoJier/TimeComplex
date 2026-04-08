@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Search, SlidersHorizontal, List, Globe, Users, User, X, Check, Trash2, Calendar, LogIn, UserPlus, Lock, Mail, Eye, EyeOff, Undo, Sparkles, FileText, Link, Send, Loader2, Upload, MousePointer2, Square, Circle, StickyNote, Image as ImageIcon } from "lucide-react";
+import { Search, SlidersHorizontal, List, Globe, Users, User, X, Check, Trash2, Calendar, LogIn, UserPlus, Lock, Mail, Eye, EyeOff, Undo, Sparkles, FileText, Link, Send, Loader2, Upload, MousePointer2, Square, Circle, StickyNote, Image as ImageIcon, Pen, Eraser } from "lucide-react";
 
 interface CanvasEvent {
   id: string;
@@ -23,6 +23,9 @@ interface TimeBlock {
 }
 
 type TimelineTick = { type: 'year' | 'month' | 'quarter'; value: number | string; x: number };
+
+type StrokePoint = { x: number, y: number };
+type Stroke = { id: string, color: string, width: number, points: StrokePoint[] };
 
 // 9 Zoom Levels
 const ZOOM_LEVELS = [
@@ -63,17 +66,22 @@ const INITIAL_EVENTS: CanvasEvent[] = [
 ];
 
 const dateToOffset = (dateStr: string) => {
-  const [yearStr, monthStr, dayStr] = dateStr.split('-');
-  const year = Number(yearStr);
-  const monthIndex = Number(monthStr) - 1;
-  const dayIndex = Number(dayStr) - 1;
-  if (!Number.isFinite(year) || !Number.isFinite(monthIndex) || !Number.isFinite(dayIndex)) return 0;
+  if (!dateStr) return 0;
+  const parts = dateStr.split('-');
+  const year = Number(parts[0]);
+  const monthIndex = parts.length > 1 ? Number(parts[1]) - 1 : 0;
+  const dayIndex = parts.length > 2 ? Number(parts[2]) - 1 : 0;
+  
+  if (!Number.isFinite(year)) return 0;
+
+  const safeMonthIndex = Number.isFinite(monthIndex) ? monthIndex : 0;
+  const safeDayIndex = Number.isFinite(dayIndex) ? dayIndex : 0;
 
   const baseYear = BASE_DATE.getFullYear();
-  const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
-  const clampedDayIndex = Math.max(0, Math.min(daysInMonth - 1, dayIndex));
+  const daysInMonth = new Date(year, safeMonthIndex + 1, 0).getDate();
+  const clampedDayIndex = Math.max(0, Math.min(daysInMonth - 1, safeDayIndex));
 
-  return (year - baseYear) + monthIndex / 12 + (clampedDayIndex / daysInMonth) / 12;
+  return (year - baseYear) + safeMonthIndex / 12 + (clampedDayIndex / daysInMonth) / 12;
 };
 
 const offsetToDate = (offset: number) => {
@@ -103,6 +111,8 @@ export default function Home() {
   const [timeBlocks, setTimeBlocks] = useState<TimeBlock[]>([]);
   const [windowSize, setWindowSize] = useState({ width: 0, height: 0 });
   const containerRef = useRef<HTMLDivElement>(null);
+  const [todayIso, setTodayIso] = useState(() => BASE_DATE.toISOString().slice(0, 10));
+  const todayYear = Number(todayIso.slice(0, 4));
 
   const [editingEventId, setEditingEventId] = useState<string | null>(null);
   const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
@@ -125,11 +135,30 @@ export default function Home() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [currentUser, setCurrentUser] = useState<{ id: string, username: string } | null>(null);
   const [loginError, setLoginError] = useState("");
-  const [activeTool, setActiveTool] = useState<'select' | 'block' | 'point' | 'sticker' | 'import' | 'ai' | 'search'>('select');
+  const [activeTool, setActiveTool] = useState<'select' | 'block' | 'point' | 'sticker' | 'import' | 'ai' | 'search' | 'draw' | 'eraser'>('point');
   const [searchQuery, setSearchQuery] = useState("");
   const [isSearchExpanded, setIsSearchExpanded] = useState(false);
   const [searchResults, setSearchResults] = useState<CanvasEvent[]>([]);
   const [highlightedEventId, setHighlightedEventId] = useState<string | null>(null);
+  const [hydrated, setHydrated] = useState(false);
+
+  const [strokes, setStrokes] = useState<Stroke[]>([]);
+  const [currentStroke, setCurrentStroke] = useState<Stroke | null>(null);
+  const [brushWidth, setBrushWidth] = useState(4);
+  const [isErasing, setIsErasing] = useState(false);
+  const [eraserTrail, setEraserTrail] = useState<StrokePoint[]>([]);
+
+  useEffect(() => {
+    const d = new Date();
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    setTodayIso(`${yyyy}-${mm}-${dd}`);
+  }, []);
+
+  useEffect(() => {
+    setHydrated(true);
+  }, []);
 
   const cancelEdit = () => {
     setPendingEvent(null);
@@ -143,7 +172,7 @@ export default function Home() {
     setCurrentCategory("其他");
   };
 
-  const switchTool = (tool: 'select' | 'block' | 'point' | 'sticker' | 'import' | 'ai' | 'search') => {
+  const switchTool = (tool: 'select' | 'block' | 'point' | 'sticker' | 'import' | 'ai' | 'search' | 'draw' | 'eraser') => {
     setActiveTool(tool);
     setIsSearchExpanded(false);
     cancelEdit(); // 切换工具时强制清除所有编辑/创建状态
@@ -306,6 +335,23 @@ export default function Home() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [undoStack, events, currentUser]); // Added missing dependencies and kept it stable
 
+  useEffect(() => {
+    // 阻止各个浏览器（Chrome, Safari, Firefox 等）在触控板双指捏合时触发整个网页的原生缩放或前进后退
+    const preventDefaultGestures = (e: WheelEvent) => {
+      // ctrlKey 是大多数浏览器用于标记触控板捏合 (Pinch-to-zoom) 的通用方式
+      if (e.ctrlKey) {
+        e.preventDefault();
+      }
+    };
+    
+    // 必须使用 passive: false 才能拦截默认的滚动/缩放行为
+    document.addEventListener('wheel', preventDefaultGestures, { passive: false });
+    
+    return () => {
+      document.removeEventListener('wheel', preventDefaultGestures);
+    };
+  }, []);
+
   const currentZoom = ZOOM_LEVELS[zoomIndex];
   const pixelsPerYear = useMemo(() => {
     if (windowSize.width === 0) return 600;
@@ -383,10 +429,8 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (gridSizePx === 0) return;
-    const maxRow = 5000 / gridSizePx + 2;
-    setTimeBlocks(prev => prev.map(block => (block.y > maxRow ? { ...block, y: Math.round(block.y / gridSizePx) } : block)));
-  }, [gridSizePx]);
+    // Empty effect to remove block Y mutation
+  }, []);
 
   const dynamicTimelineTicks = useMemo(() => {
     if (windowSize.width === 0) return [];
@@ -517,19 +561,40 @@ export default function Home() {
   };
 
   const handleWheel = (e: React.WheelEvent) => {
+    // 阻止默认的页面滚动或浏览器缩放行为
     e.preventDefault();
-    if (e.deltaY < 0) {
-      if (zoomIndex > 0) {
-        const nextIndex = zoomIndex - 1;
-        adjustOffsetForZoom(nextIndex, e.clientX);
-        setZoomLevelIndex(nextIndex);
+
+    // 在 Chrome 和部分浏览器中，触控板双指捏合不一定会触发 e.ctrlKey=true
+    // 但是，鼠标滚轮和触控板滑动产生的事件特征有明显区别。
+    // 如果用户希望在网页上：
+    // 1. 只有纯粹的垂直滚动（deltaY 有值，deltaX 严格为 0）才被视为缩放（符合鼠标滚轮的特征）。
+    // 2. 其他情况（包括任何带有 deltaX 的双指滑动或斜向滚动）都被视为平移。
+
+    const isVerticalScrollOnly = Math.abs(e.deltaY) > 0 && e.deltaX === 0;
+
+    if (isVerticalScrollOnly) {
+      // 触发缩放 (Zoom)
+      if (e.deltaY > 0) {
+        if (zoomIndex < ZOOM_LEVELS.length - 1) {
+          const nextIndex = zoomIndex + 1;
+          adjustOffsetForZoom(nextIndex, e.clientX);
+          setZoomLevelIndex(nextIndex);
+        }
+      } else if (e.deltaY < 0) {
+        if (zoomIndex > 0) {
+          const nextIndex = zoomIndex - 1;
+          adjustOffsetForZoom(nextIndex, e.clientX);
+          setZoomLevelIndex(nextIndex);
+        }
       }
     } else {
-      if (zoomIndex < ZOOM_LEVELS.length - 1) {
-        const nextIndex = zoomIndex + 1;
-        adjustOffsetForZoom(nextIndex, e.clientX);
-        setZoomLevelIndex(nextIndex);
-      }
+      // 触发平移 (Pan)
+      // 注意：如果只是双指垂直滑动，因为 deltaX 不严格为 0（触控板很难做到绝对的 deltaX=0），
+      // 或者就是明显的双指横向滑动，都会走到这里。
+      setOffset(prev => ({
+        x: prev.x - e.deltaX,
+        y: prev.y - e.deltaY
+      }));
     }
   };
 
@@ -546,6 +611,23 @@ export default function Home() {
     if (e.button === 1 || (e.button === 0 && (e.altKey || e.ctrlKey)) || activeTool === 'select') { 
       setIsPanning(true);
       e.preventDefault();
+    } else if (e.button === 0 && activeTool === 'draw') {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect) {
+        const rawYearOffset = (e.clientX - rect.left - offset.x) / pixelsPerYear;
+        const canvasY = (e.clientY - rect.top - offset.y);
+        setCurrentStroke({ id: Math.random().toString(36).slice(2, 11), color: currentColor, width: brushWidth, points: [{ x: rawYearOffset, y: canvasY }] });
+      }
+      return;
+    } else if (e.button === 0 && activeTool === 'eraser') {
+      setIsErasing(true);
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect) {
+        const canvasX = e.clientX - rect.left - offset.x;
+        const canvasY = e.clientY - rect.top - offset.y;
+        setEraserTrail([{ x: canvasX, y: canvasY }]);
+      }
+      return;
     } else if (e.button === 0 && !pendingEvent && !editingEventId && !editingBlockId && !pendingBlock) {
       const rect = containerRef.current?.getBoundingClientRect();
       if (!rect) return;
@@ -556,7 +638,7 @@ export default function Home() {
       const timeStr = offsetToDate(yearOffset);
 
       if (activeTool === 'block') {
-        const row = gridSizePx === 0 ? 0 : Math.round(canvasY / gridSizePx);
+        const row = Math.floor(canvasY / 60);
         const existing = findTimeBlockAtCell(row, yearOffset);
         if (existing) {
           openTimeBlockEditor(existing);
@@ -576,7 +658,33 @@ export default function Home() {
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
-    if (isPanning) {
+    if (currentStroke && activeTool === 'draw') {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect) {
+        const rawYearOffset = (e.clientX - rect.left - offset.x) / pixelsPerYear;
+        const canvasY = (e.clientY - rect.top - offset.y);
+        setCurrentStroke(prev => prev ? { ...prev, points: [...prev.points, { x: rawYearOffset, y: canvasY }] } : null);
+      }
+    } else if (isErasing && activeTool === 'eraser') {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect) {
+        const canvasX = e.clientX - rect.left - offset.x;
+        const canvasY = e.clientY - rect.top - offset.y;
+        
+        setEraserTrail(prev => [...prev, { x: canvasX, y: canvasY }]);
+
+        setStrokes(prevStrokes => prevStrokes.filter(stroke => {
+          const hit = stroke.points.some(p => {
+            const px = p.x * pixelsPerYear;
+            const py = p.y;
+            // 距离计算，如果橡皮擦半径是 30
+            const dist = Math.sqrt(Math.pow(px - canvasX, 2) + Math.pow(py - canvasY, 2));
+            return dist < 30;
+          });
+          return !hit; // 没碰到的保留
+        }));
+      }
+    } else if (isPanning) {
       setOffset(prev => ({ x: prev.x + e.movementX, y: prev.y + e.movementY }));
     } else if (pendingBlock && !editingBlockId) {
       const rect = containerRef.current?.getBoundingClientRect();
@@ -597,6 +705,15 @@ export default function Home() {
   };
 
   const handleMouseUp = () => {
+    if (currentStroke) {
+      setStrokes(prev => [...prev, currentStroke]);
+      setCurrentStroke(null);
+    }
+    if (isErasing) {
+      setIsErasing(false);
+      setEraserTrail([]);
+    }
+
     if (isPanning) {
       setIsPanning(false);
     } else if (pendingBlock && activeTool === 'block' && !editingBlockId) {
@@ -649,6 +766,8 @@ export default function Home() {
       return;
     }
 
+    if (activeTool === 'draw' || activeTool === 'eraser') return;
+
     // 只有在点或方块模式下才允许通过点击创建
     if (activeTool !== 'point' && activeTool !== 'block') {
       if (pendingEvent || editingEventId || pendingBlock || editingBlockId) {
@@ -663,7 +782,7 @@ export default function Home() {
         const rawYearOffset = (e.clientX - rect.left - offset.x) / pixelsPerYear;
         const yearOffset = snapYearOffsetToGrid(rawYearOffset);
         const canvasY = (e.clientY - rect.top - offset.y);
-        const row = gridSizePx === 0 ? 0 : Math.round(canvasY / gridSizePx);
+        const row = Math.floor(canvasY / 60);
         const existing = findTimeBlockAtCell(row, yearOffset);
         if (existing) {
           openTimeBlockEditor(existing);
@@ -783,7 +902,7 @@ export default function Home() {
       return;
     }
 
-    const fallbackRow = Math.round(400 / gridSizePx);
+    const fallbackRow = Math.floor(400 / 60);
     const newBlockData = {
       startTime: currentTime,
       endTime: currentEndTime,
@@ -843,10 +962,21 @@ export default function Home() {
     }
   };
 
+  if (!hydrated) {
+    return (
+      <main className="relative min-h-screen w-full overflow-hidden bg-[#fdf2f8] font-sans text-slate-800">
+        <div className="fixed inset-0 pointer-events-none z-0">
+          <div className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] bg-pink-200/20 blur-[120px] rounded-full" />
+          <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] bg-blue-200/20 blur-[120px] rounded-full" />
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main 
       ref={containerRef}
-      className="relative min-h-screen w-full overflow-hidden bg-[#fdf2f8] font-sans text-slate-800"
+      className="relative min-h-screen w-full overflow-hidden bg-[#fdf2f8] font-sans text-slate-800 touch-none"
       onWheel={handleWheel}
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
@@ -860,22 +990,37 @@ export default function Home() {
         <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] bg-blue-200/20 blur-[120px] rounded-full" />
       </div>
 
-      {/* Red vertical "Now" line - Hidden as per user request */}
-      {/* <div className="fixed top-0 bottom-0 w-[2px] bg-red-500/40 z-20 pointer-events-none shadow-[0_0_15px_rgba(239,68,68,0.4)]" style={{ left: offset.x + dateToOffset("2026-03-31") * pixelsPerYear }}>
-        <div className="absolute top-36 -left-12 w-24 text-center">
-          <span className="text-[10px] font-black text-red-600/50 tracking-widest uppercase bg-white/40 px-2 py-0.5 rounded-full backdrop-blur-sm">Present</span>
+      {hydrated && windowSize.width > 0 && (
+        <div className="fixed top-0 bottom-0 w-[2px] bg-red-500/40 z-20 pointer-events-none shadow-[0_0_15px_rgba(239,68,68,0.4)]" style={{ left: offset.x + dateToOffset(todayIso) * pixelsPerYear }}>
+          <div className="absolute top-36 -left-12 w-24 text-center">
+            <span className="text-[10px] font-black text-red-600/50 tracking-widest uppercase bg-white/40 px-2 py-0.5 rounded-full backdrop-blur-sm">Present</span>
+          </div>
         </div>
-      </div> */}
+      )}
+
+      {/* 固定正方形网格背景层 - 复古练习本风格 */}
+      <div className="fixed inset-0 z-0 pointer-events-none bg-[#F7F4EB]" style={{
+        backgroundImage: `
+          linear-gradient(to right, rgba(160, 140, 100, 0.15) 1px, transparent 1px), 
+          linear-gradient(to bottom, rgba(160, 140, 100, 0.15) 1px, transparent 1px),
+          linear-gradient(to right, rgba(160, 140, 100, 0.05) 1px, transparent 1px), 
+          linear-gradient(to bottom, rgba(160, 140, 100, 0.05) 1px, transparent 1px),
+          url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)' opacity='0.08'/%3E%3C/svg%3E")
+        `,
+        backgroundSize: `
+          60px 60px,
+          60px 60px,
+          15px 15px,
+          15px 15px,
+          200px 200px
+        `,
+        backgroundPosition: `${offset.x % 60}px ${offset.y % 60}px`,
+        boxShadow: 'inset 0 0 100px rgba(160, 140, 100, 0.1)', // 添加边缘暗角，增加纸张做旧感
+      }} />
       
       <div className="absolute inset-0 z-10 origin-top-left will-change-transform" style={{ transform: `translate(${offset.x}px, ${offset.y}px)` }}>
-        <div className="absolute inset-[-40000px] pointer-events-none" style={{
-          backgroundImage: `linear-gradient(to right, rgba(0,0,0,0.04) 1px, transparent 1px), linear-gradient(to bottom, rgba(0,0,0,0.04) 1px, transparent 1px)`,
-          backgroundSize: `${gridSizePx}px ${gridSizePx}px`,
-          backgroundPosition: `40000px 40000px`,
-        }} />
-
         <div className="relative w-[40000px] h-[5000px]">
-          <svg className="absolute inset-0 w-full h-full pointer-events-none overflow-visible">
+          <svg className="absolute inset-0 w-full h-full pointer-events-auto overflow-visible">
             <defs>
               <linearGradient id="grad-yellow" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stopColor="#ef4444" stopOpacity="0.2" /><stop offset="50%" stopColor="#ef4444" stopOpacity="0.6" /><stop offset="100%" stopColor="#ef4444" stopOpacity="0.2" /></linearGradient>
               <linearGradient id="grad-purple" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stopColor="#f59e0b" stopOpacity="0.2" /><stop offset="50%" stopColor="#f59e0b" stopOpacity="0.6" /><stop offset="100%" stopColor="#f59e0b" stopOpacity="0.2" /></linearGradient>
@@ -890,39 +1035,86 @@ export default function Home() {
             <motion.path d={`M ${0 * pixelsPerYear},1200 C 2 * pixelsPerYear,1200 ${5 * pixelsPerYear},1300 ${8 * pixelsPerYear},1380 S ${11 * pixelsPerYear},1500 ${14 * pixelsPerYear},1500`} stroke="url(#grad-teal)" strokeWidth="32" fill="none" strokeLinecap="round" /> */}
 
             <g className="pointer-events-auto">
+              {/* Strokes */}
+              <g className="strokes">
+                {strokes.map(stroke => {
+                  if (stroke.points.length === 0) return null;
+                  const d = stroke.points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x * pixelsPerYear} ${p.y}`).join(' ');
+                  return <path key={stroke.id} d={d} fill="none" stroke={stroke.color} strokeWidth={stroke.width} strokeLinecap="round" strokeLinejoin="round" />;
+                })}
+                {currentStroke && (
+                  <path 
+                    d={currentStroke.points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x * pixelsPerYear} ${p.y}`).join(' ')} 
+                    fill="none" 
+                    stroke={currentStroke.color} 
+                    strokeWidth={currentStroke.width} 
+                    strokeLinecap="round" 
+                    strokeLinejoin="round" 
+                  />
+                )}
+                {/* Eraser Trail */}
+                {eraserTrail.length > 0 && (
+                  <path 
+                    d={eraserTrail.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')} 
+                    fill="none" 
+                    stroke="rgba(239, 68, 68, 0.4)" 
+                    strokeWidth={30} 
+                    strokeLinecap="round" 
+                    strokeLinejoin="round" 
+                    className="pointer-events-none"
+                    style={{ filter: 'blur(2px)' }}
+                  />
+                )}
+              </g>
+
               <AnimatePresence>
                 {/* 渲染已有的 TimeBlocks */}
-                {timeBlocks.map(block => (
-                  <motion.rect
-                    key={block.id}
-                    x={dateToOffset(block.startTime) * pixelsPerYear}
-                    y={block.y * gridSizePx}
-                    width={(dateToOffset(block.endTime) - dateToOffset(block.startTime)) * pixelsPerYear}
-                    height={gridSizePx}
-                    fill={block.color}
-                    fillOpacity="0.2"
-                    stroke={block.color}
-                    strokeWidth="2"
-                    rx="8"
-                    initial={{ opacity: 0, scale: 0.9 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    whileHover={{ fillOpacity: 0.3 }}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      openTimeBlockEditor(block);
-                    }}
-                    style={{ cursor: 'pointer' }}
-                  />
-                ))}
+                {timeBlocks.map(block => {
+                  const x = dateToOffset(block.startTime) * pixelsPerYear;
+                  const y = block.y * 60 + 10;
+                  const width = (dateToOffset(block.endTime) - dateToOffset(block.startTime)) * pixelsPerYear;
+                  return (
+                    <g
+                      key={block.id}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openTimeBlockEditor(block);
+                      }}
+                      style={{ cursor: 'pointer' }}
+                    >
+                      <motion.rect
+                        x={x}
+                        y={y}
+                        width={width}
+                        height={40}
+                        fill={block.color}
+                        fillOpacity="0.2"
+                        stroke={block.color}
+                        strokeWidth="2"
+                        rx="8"
+                        initial={{ opacity: 0, scale: 0.9 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        whileHover={{ fillOpacity: 0.3 }}
+                      />
+                      <foreignObject x={x} y={y} width={Math.max(0, width)} height={40}>
+                        <div className="w-full h-full flex items-center justify-center px-3 pointer-events-none">
+                          <div className="text-[11px] font-semibold text-slate-700 truncate whitespace-nowrap overflow-hidden max-w-full">
+                            {block.label}
+                          </div>
+                        </div>
+                      </foreignObject>
+                    </g>
+                  );
+                })}
 
                 {/* 渲染正在拖拽创建的 TimeBlock 预览 */}
                 {pendingBlock && (
                   <g>
                     <rect
                       x={Math.min(pendingBlock.startX, pendingBlock.currentX) * pixelsPerYear}
-                      y={pendingBlock.y * gridSizePx}
+                      y={pendingBlock.y * 60 + 10}
                       width={Math.abs(pendingBlock.currentX - pendingBlock.startX) * pixelsPerYear}
-                      height={gridSizePx}
+                      height={40}
                       fill={currentColor}
                       fillOpacity="0.3"
                       stroke={currentColor}
@@ -933,7 +1125,7 @@ export default function Home() {
                     {/* 时间提示条 */}
                     <foreignObject 
                       x={Math.min(pendingBlock.startX, pendingBlock.currentX) * pixelsPerYear} 
-                      y={pendingBlock.y * gridSizePx - 45} 
+                      y={pendingBlock.y * 60 - 35} 
                       width="300" 
                       height="40"
                     >
@@ -952,6 +1144,21 @@ export default function Home() {
               </AnimatePresence>
 
               <AnimatePresence>
+                {events.map(event => (
+                  <Marker
+                    key={event.id}
+                    x={dateToOffset(event.time) * pixelsPerYear}
+                    y={event.y}
+                    color={event.color}
+                    label={event.label}
+                    onClick={() => startEditing(event)}
+                    isEditing={editingEventId === event.id}
+                    isHighlighted={highlightedEventId === event.id}
+                  />
+                ))}
+              </AnimatePresence>
+
+              <AnimatePresence>
                 {(pendingEvent || (pendingBlock && currentTime && !isPanning)) && (
                   <motion.g initial={{ opacity: 0, scale: 0.8 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.8 }} className="pointer-events-auto">
                     {/* 只有在纯点事件时显示圆圈 */}
@@ -959,7 +1166,7 @@ export default function Home() {
                     
                     <foreignObject 
                       x={(currentTime ? dateToOffset(currentTime) : 0) * pixelsPerYear - 140} 
-                      y={(pendingEvent?.y ?? (pendingBlock ? pendingBlock.y * gridSizePx : 400)) + 25} 
+                      y={(pendingEvent?.y ?? (pendingBlock ? pendingBlock.y * 60 + 10 : 400)) + 25} 
                       width="280" 
                       height="320"
                     >
@@ -1040,9 +1247,12 @@ export default function Home() {
         </div>
       </div>
 
-      <div className="fixed inset-0 pointer-events-none z-50">
+      <div className="fixed inset-0 pointer-events-none z-50 overflow-hidden">
         <div className="absolute top-10 left-10 pointer-events-auto" onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} onMouseUp={e => e.stopPropagation()}>
-          <h1 className="text-3xl font-light tracking-wider text-slate-900/80 leading-tight">时间集合体<span className="block text-xl font-extralight opacity-40 mt-1">Time Complex</span></h1>
+          <h1 className="text-3xl font-light tracking-wider text-slate-900/80 leading-tight">
+            <span className="sr-only">时间集合体</span>
+            Time Complex
+          </h1>
         </div>
 
         {/* Top Dynamic Multi-level Timeline */}
@@ -1056,7 +1266,7 @@ export default function Home() {
                   {tick.type === 'year' ? (
                     <>
                       <span className="text-[12px] font-black text-slate-700/80 mb-1">{tick.value}</span>
-                      <div className={`w-3 h-3 rotate-45 border-2 ${tick.value === 2026 ? 'border-red-500 bg-red-100 shadow-[0_0_10px_rgba(239,68,68,0.5)] scale-125' : (typeof tick.value === 'number' && tick.value % 2 === 0 ? 'border-blue-400/60 bg-blue-50/50' : 'border-slate-300/60 bg-slate-50/50')}`} />
+                      <div className={`w-3 h-3 rotate-45 border-2 ${hydrated && tick.value === todayYear ? 'border-red-500 bg-red-100 shadow-[0_0_10px_rgba(239,68,68,0.5)] scale-125' : (typeof tick.value === 'number' && tick.value % 2 === 0 ? 'border-blue-400/60 bg-blue-50/50' : 'border-slate-300/60 bg-slate-50/50')}`} />
                     </>
                   ) : (
                     <>
@@ -1122,7 +1332,7 @@ export default function Home() {
          </div>
 
         <div className="fixed bottom-10 left-1/2 -translate-x-1/2 z-[100] pointer-events-auto" onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} onMouseUp={e => e.stopPropagation()}>
-          <div className="glass px-3 py-3 rounded-3xl border border-white/60 shadow-2xl flex items-center gap-2">
+          <div suppressHydrationWarning className="glass px-3 py-3 rounded-3xl border border-white/60 shadow-2xl flex items-center gap-2">
             {/* 0. 选中模式 */}
             <motion.button 
               whileHover={{ scale: 1.05, y: -2 }}
@@ -1187,6 +1397,53 @@ export default function Home() {
             >
               <Sparkles className="w-6 h-6" />
               <span className="absolute -top-10 left-1/2 -translate-x-1/2 px-2 py-1 bg-slate-800 text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none shadow-xl">AI 提取</span>
+            </motion.button>
+
+            <div className="w-[1px] h-10 bg-slate-200/50 mx-2" />
+
+            {/* 画笔 */}
+            <div className="relative group/draw">
+              <motion.button 
+                whileHover={{ scale: 1.05, y: -2 }}
+                whileTap={{ scale: 0.95 }}
+                onClick={() => switchTool('draw')}
+                className={`group relative p-3.5 rounded-2xl transition-all flex items-center justify-center ${activeTool === 'draw' ? 'bg-slate-800 text-white shadow-lg' : 'text-slate-500 hover:bg-white/50'}`}
+              >
+                <Pen className="w-6 h-6" />
+                <span className="absolute -top-10 left-1/2 -translate-x-1/2 px-2 py-1 bg-slate-800 text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none shadow-xl z-50">画笔</span>
+              </motion.button>
+              
+              <AnimatePresence>
+                {activeTool === 'draw' && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                    className="absolute bottom-full mb-4 left-1/2 -translate-x-1/2 glass p-3 rounded-2xl flex flex-col gap-3 min-w-[140px] z-50 pointer-events-auto"
+                  >
+                    <div className="flex gap-1.5 justify-center flex-wrap">
+                      {["#fbbf24", "#c084fc", "#2dd4bf", "#ef4444", "#3b82f6", "#1e293b", "#ffffff"].map(c => (
+                        <button key={c} onClick={() => setCurrentColor(c)} className={`w-4 h-4 rounded-full transition-transform hover:scale-110 ${currentColor === c ? 'ring-2 ring-offset-2 ring-slate-400 scale-125' : ''}`} style={{ backgroundColor: c }} />
+                      ))}
+                    </div>
+                    <div className="flex items-center gap-2 px-1">
+                      <span className="text-[10px] font-bold text-slate-400">粗细</span>
+                      <input type="range" min="1" max="20" value={brushWidth} onChange={e => setBrushWidth(Number(e.target.value))} className="flex-1 accent-slate-800" />
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+
+            {/* 橡皮擦 */}
+            <motion.button 
+              whileHover={{ scale: 1.05, y: -2 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={() => switchTool('eraser')}
+              className={`group relative p-3.5 rounded-2xl transition-all flex items-center justify-center ${activeTool === 'eraser' ? 'bg-red-500 text-white shadow-lg shadow-red-500/30' : 'text-slate-500 hover:bg-white/50'}`}
+            >
+              <Eraser className="w-6 h-6" />
+              <span className="absolute -top-10 left-1/2 -translate-x-1/2 px-2 py-1 bg-red-500 text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none shadow-xl z-50">橡皮擦 (滑动擦除)</span>
             </motion.button>
 
             <div className="w-[1px] h-10 bg-slate-200/50 mx-2" />
