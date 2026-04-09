@@ -147,6 +147,7 @@ export default function Home() {
   const [brushWidth, setBrushWidth] = useState(4);
   const [isErasing, setIsErasing] = useState(false);
   const [eraserTrail, setEraserTrail] = useState<StrokePoint[]>([]);
+  const [resizingBlock, setResizingBlock] = useState<{ id: string, edge: 'left' | 'right', y: number } | null>(null);
 
   useEffect(() => {
     const d = new Date();
@@ -165,6 +166,7 @@ export default function Home() {
     setPendingBlock(null);
     setEditingEventId(null);
     setEditingBlockId(null);
+    setResizingBlock(null);
     setCurrentLabel("");
     setCurrentTime("");
     setCurrentTimeEnd("");
@@ -658,7 +660,37 @@ export default function Home() {
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
-    if (currentStroke && activeTool === 'draw') {
+    if (resizingBlock) {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect) {
+        const rawYearOffset = (e.clientX - rect.left - offset.x) / pixelsPerYear;
+        const yearOffset = snapYearOffsetToGrid(rawYearOffset);
+        const newTimeStr = offsetToDate(yearOffset);
+        
+        setTimeBlocks(prev => prev.map(b => {
+          if (b.id === resizingBlock.id) {
+            if (resizingBlock.edge === 'left') {
+              const safeTime = newTimeStr >= b.endTime ? b.endTime : newTimeStr;
+              return { ...b, startTime: safeTime };
+            } else {
+              const safeTime = newTimeStr <= b.startTime ? b.startTime : newTimeStr;
+              return { ...b, endTime: safeTime };
+            }
+          }
+          return b;
+        }));
+        
+        if (editingBlockId === resizingBlock.id) {
+          if (resizingBlock.edge === 'left') {
+            const safeTime = newTimeStr >= currentEndTime ? currentEndTime : newTimeStr;
+            setCurrentTime(safeTime);
+          } else {
+            const safeTime = newTimeStr <= currentTime ? currentTime : newTimeStr;
+            setCurrentTimeEnd(safeTime);
+          }
+        }
+      }
+    } else if (currentStroke && activeTool === 'draw') {
       const rect = containerRef.current?.getBoundingClientRect();
       if (rect) {
         const rawYearOffset = (e.clientX - rect.left - offset.x) / pixelsPerYear;
@@ -705,6 +737,10 @@ export default function Home() {
   };
 
   const handleMouseUp = () => {
+    if (resizingBlock) {
+      setResizingBlock(null);
+      return;
+    }
     if (currentStroke) {
       setStrokes(prev => [...prev, currentStroke]);
       setCurrentStroke(null);
@@ -760,7 +796,7 @@ export default function Home() {
   };
 
   const handleCanvasClick = (e: React.MouseEvent) => {
-    if (isPanning) return;
+    if (isPanning || resizingBlock) return;
     if (authMode) {
       setAuthMode(null);
       return;
@@ -1097,12 +1133,57 @@ export default function Home() {
                         whileHover={{ fillOpacity: 0.3 }}
                       />
                       <foreignObject x={x} y={y} width={Math.max(0, width)} height={40}>
-                        <div className="w-full h-full flex items-center justify-center px-3 pointer-events-none">
-                          <div className="text-[11px] font-semibold text-slate-700 truncate whitespace-nowrap overflow-hidden max-w-full">
-                            {block.label}
-                          </div>
+                        <div className="w-full h-full flex items-center justify-center px-3">
+                          {editingBlockId === block.id ? (
+                            <input
+                              autoFocus
+                              value={currentLabel}
+                              onChange={(e) => setCurrentLabel(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') saveTimeBlock();
+                              }}
+                              className="w-full bg-transparent border-none outline-none text-[11px] font-semibold text-slate-900 text-center"
+                            />
+                          ) : (
+                            <div className="text-[11px] font-semibold text-slate-700 truncate whitespace-nowrap overflow-hidden max-w-full pointer-events-none">
+                              {block.label}
+                            </div>
+                          )}
                         </div>
                       </foreignObject>
+                      
+                      {/* Left Drag Handle */}
+                      <rect
+                        x={x}
+                        y={y}
+                        width={10}
+                        height={40}
+                        fill="transparent"
+                        style={{ cursor: 'ew-resize' }}
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          setResizingBlock({ id: block.id, edge: 'left', y: block.y });
+                          if (editingBlockId !== block.id) {
+                            openTimeBlockEditor(block);
+                          }
+                        }}
+                      />
+                      {/* Right Drag Handle */}
+                      <rect
+                        x={x + Math.max(0, width) - 10}
+                        y={y}
+                        width={10}
+                        height={40}
+                        fill="transparent"
+                        style={{ cursor: 'ew-resize' }}
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          setResizingBlock({ id: block.id, edge: 'right', y: block.y });
+                          if (editingBlockId !== block.id) {
+                            openTimeBlockEditor(block);
+                          }
+                        }}
+                      />
                     </g>
                   );
                 })}
@@ -1122,6 +1203,25 @@ export default function Home() {
                       strokeDasharray="4 2"
                       rx="8"
                     />
+                    <foreignObject 
+                      x={Math.min(pendingBlock.startX, pendingBlock.currentX) * pixelsPerYear} 
+                      y={pendingBlock.y * 60 + 10} 
+                      width={Math.abs(pendingBlock.currentX - pendingBlock.startX) * pixelsPerYear} 
+                      height={40}
+                    >
+                      <div className="w-full h-full flex items-center justify-center px-3">
+                        <input
+                          autoFocus
+                          value={currentLabel}
+                          onChange={(e) => setCurrentLabel(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') saveTimeBlock();
+                          }}
+                          className="w-full bg-transparent border-none outline-none text-[11px] font-semibold text-slate-900 text-center"
+                        />
+                      </div>
+                    </foreignObject>
+
                     {/* 时间提示条 */}
                     <foreignObject 
                       x={Math.min(pendingBlock.startX, pendingBlock.currentX) * pixelsPerYear} 
@@ -1183,15 +1283,17 @@ export default function Home() {
                             </div>
                           </div>
 
-                          <input 
-                            autoFocus 
-                            type="text" 
-                            value={currentLabel} 
-                            onChange={e => setCurrentLabel(e.target.value)} 
-                            onKeyDown={e => e.key === 'Enter' && (editingBlockId || pendingBlock ? saveTimeBlock() : saveEvent())}
-                            placeholder="输入标题..." 
-                            className="bg-transparent border-none outline-none text-lg font-bold text-slate-700 w-full placeholder:text-slate-300" 
-                          />
+                          {!(editingBlockId || (pendingBlock && activeTool === 'block')) && (
+                            <input 
+                              autoFocus 
+                              type="text" 
+                              value={currentLabel} 
+                              onChange={e => setCurrentLabel(e.target.value)} 
+                              onKeyDown={e => e.key === 'Enter' && saveEvent()}
+                              placeholder="输入标题..." 
+                              className="bg-transparent border-none outline-none text-lg font-bold text-slate-700 w-full placeholder:text-slate-300" 
+                            />
+                          )}
 
                           <div className="flex flex-col gap-2">
                             <div className="flex items-center gap-2 bg-white/30 rounded-xl px-3 py-2 border border-white/40">
