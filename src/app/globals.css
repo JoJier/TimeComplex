@@ -20,6 +20,25 @@
   --color-accent-teal: var(--accent-teal);
 }
 
+@font-face {
+  font-family: "TsangerYuYangT";
+  src:
+    local("TsangerYuYangT"),
+    local("TsangerYuYangT-Regular"),
+    url("/fonts/TsangerYuYangT.woff2") format("woff2"),
+    url("/fonts/TsangerYuYangT.ttf") format("truetype");
+  font-display: swap;
+  unicode-range:
+    U+2E80-2EFF,
+    U+2F00-2FDF,
+    U+3000-303F,
+    U+31C0-31EF,
+    U+3200-32FF,
+    U+3400-4DBF,
+    U+4E00-9FFF,
+    U+F900-FAFF;
+}
+
 body {
   background: radial-gradient(circle at 10% 20%, rgba(216, 241, 230, 0.5) 0%, rgba(233, 226, 226, 0.3) 90%),
               radial-gradient(circle at 80% 10%, rgba(255, 236, 210, 0.6) 0%, rgba(252, 182, 159, 0.4) 100%),
@@ -28,7 +47,7 @@ body {
   color: var(--foreground);
   min-height: 100vh;
   overflow-x: hidden;
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-family: "TsangerYuYangT", "Inter", system-ui, -apple-system, sans-serif;
 }
 
 .bg-grid {

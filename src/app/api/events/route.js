@@ -20,13 +20,22 @@ export async function GET(request) {
     client.release();
     
     // Map the database fields to the CanvasEvent interface used in the frontend
-    const mappedEvents = result.rows.map(row => ({
-      id: row.id.toString(),
-      time: row.start_time ? row.start_time.toISOString().split('T')[0] : '',
-      y: row.y || 400,
-      label: row.title,
-      color: row.color || "#fbbf24"
-    }));
+    const mappedEvents = result.rows.map(row => {
+      const getLocalDateString = (dateObj) => {
+        if (!dateObj) return '';
+        const offset = dateObj.getTimezoneOffset();
+        const localDate = new Date(dateObj.getTime() - (offset * 60 * 1000));
+        return localDate.toISOString().split('T')[0];
+      };
+
+      return {
+        id: row.id.toString(),
+        time: getLocalDateString(row.start_time),
+        y: row.y || 400,
+        label: row.title,
+        color: row.color || "#fbbf24"
+      };
+    });
     
     return NextResponse.json(mappedEvents);
   } catch (error) {
@@ -48,7 +57,7 @@ export async function POST(request) {
       VALUES ($1, $2, $3, $4, $5)
       RETURNING id
     `;
-    const values = [label, time, y, color, userId || 1];
+    const values = [label, time, y, color, userId || null];
     const result = await client.query(query, values);
     
     client.release();
@@ -80,5 +89,37 @@ export async function DELETE(request) {
   } catch (error) {
     console.error('API DELETE Error:', error);
     return NextResponse.json({ message: 'Error deleting event' }, { status: 500 });
+  }
+}
+
+export async function PUT(request) {
+  try {
+    const body = await request.json();
+    const { id, time, y, label, color, userId } = body;
+
+    if (!id) {
+      return NextResponse.json({ message: 'ID is required for update' }, { status: 400 });
+    }
+
+    const client = await pool.connect();
+    
+    const query = `
+      UPDATE events 
+      SET title = $1,
+          start_time = $2,
+          y = $3,
+          color = $4,
+          user_id = COALESCE($5, user_id)
+      WHERE id = $6
+    `;
+    const values = [label, time, y, color, userId ?? null, id];
+    
+    await client.query(query, values);
+    client.release();
+
+    return NextResponse.json({ success: true });
+  } catch (error) {
+    console.error('API PUT Error:', error);
+    return NextResponse.json({ message: 'Error updating event' }, { status: 500 });
   }
 }

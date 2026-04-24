@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Search, SlidersHorizontal, List, Globe, Users, User, X, Check, Trash2, Calendar, LogIn, UserPlus, Lock, Mail, Eye, EyeOff, Undo, Sparkles, FileText, Link, Send, Loader2, Upload, MousePointer2, Square, Circle, StickyNote, Image as ImageIcon, Pen, Eraser } from "lucide-react";
+import { Search, SlidersHorizontal, List, Globe, Users, User, X, Check, Trash2, Calendar, LogIn, UserPlus, Lock, Mail, Eye, EyeOff, Undo, Sparkles, FileText, Link, Send, Loader2, Upload, MousePointer2, Square, Circle, StickyNote, Image as ImageIcon, Pen, Eraser, ChevronDown } from "lucide-react";
 
 interface CanvasEvent {
   id: string;
@@ -22,18 +22,19 @@ interface TimeBlock {
   y: number;
 }
 
-type TimelineTick = { type: 'year' | 'month' | 'quarter'; value: number | string; x: number };
+type TimelineTick = { type: 'year' | 'year_minor' | 'month' | 'quarter' | 'quarter_minor'; value: number | string; x: number };
 
 type StrokePoint = { x: number, y: number };
 type Stroke = { id: string, color: string, width: number, points: StrokePoint[] };
+type CanvasSticker = { id: string, emoji: string, time: string, y: number };
 
 // 9 Zoom Levels
 const ZOOM_LEVELS = [
   { level: 1, yearsVisible: 1, tickType: 'month' },
-  { level: 2, yearsVisible: 2, tickType: 'quarter' },
+  { level: 2, yearsVisible: 2, tickType: 'month' },
   { level: 3, yearsVisible: 4, tickType: 'quarter' },
   { level: 4, yearsVisible: 6, tickType: 'quarter' },
-  { level: 5, yearsVisible: 8, tickType: 'year' },
+  { level: 5, yearsVisible: 8, tickType: 'quarter' },
   { level: 6, yearsVisible: 10, tickType: 'year' },
   { level: 7, yearsVisible: 20, tickType: 'year' },
   { level: 8, yearsVisible: 30, tickType: 'year' },
@@ -42,6 +43,18 @@ const ZOOM_LEVELS = [
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const BASE_DATE = new Date("2014-01-01");
+const RULER_MATERIAL = {
+  baseAlpha: 0.02,
+  blurPx: 2,
+  borderAlpha: 0.3,
+  topLineAlpha: 0.35,
+  gradientTopAlpha: 0.08,
+  gradientBottomAlpha: 0.04,
+  highlightAlpha: 0.09,
+  tintAlpha: 0.03,
+  shadowAlpha: 0.06,
+} as const;
+const HAND_CURSOR = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='36' height='36' viewBox='0 0 36 36'%3E%3Ctext x='4' y='27' font-size='24'%3E%F0%9F%91%8B%3C/text%3E%3C/svg%3E") 8 8, grab`;
 
 const INITIAL_EVENTS: CanvasEvent[] = [
   // COVID-19 Events (Y: 350-550)
@@ -109,20 +122,94 @@ export default function Home() {
   const [isPanning, setIsPanning] = useState(false);
   const [events, setEvents] = useState<CanvasEvent[]>(INITIAL_EVENTS);
   const [timeBlocks, setTimeBlocks] = useState<TimeBlock[]>([]);
+  const [stickers, setStickers] = useState<CanvasSticker[]>([]);
   const [windowSize, setWindowSize] = useState({ width: 0, height: 0 });
   const containerRef = useRef<HTMLDivElement>(null);
+  const deletedStrokeIdsRef = useRef<Set<string>>(new Set());
+  const deletedStickerIdsRef = useRef<Set<string>>(new Set());
   const [todayIso, setTodayIso] = useState(() => BASE_DATE.toISOString().slice(0, 10));
   const todayYear = Number(todayIso.slice(0, 4));
 
-  const [editingEventId, setEditingEventId] = useState<string | null>(null);
-  const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
-  const [pendingEvent, setPendingEvent] = useState<{ x: number, y: number, time: string } | null>(null);
-  const [pendingBlock, setPendingBlock] = useState<{ startX: number, currentX: number, y: number, startTime: string, endTime: string } | null>(null);
+  const [interaction, setInteraction] = useState<{
+    type: 'idle' | 'creating_event' | 'editing_event' | 'creating_block' | 'editing_block' | 'resizing_block' | 'dragging_element';
+    eventId?: string;
+    blockId?: string;
+    x?: number;
+    y?: number;
+    time?: string;
+    startX?: number;
+    currentX?: number;
+    startTime?: string;
+    endTime?: string;
+    edge?: 'left' | 'right';
+    elementType?: 'event' | 'block';
+    elementId?: string;
+    offsetX?: number;
+    offsetY?: number;
+  }>({ type: 'idle' });
+
+  // --- Auth Focus Refs ---
+  const usernameRef = useRef<HTMLInputElement>(null);
+  const emailRef = useRef<HTMLInputElement>(null);
+  const passwordRef = useRef<HTMLInputElement>(null);
+  const confirmPasswordRef = useRef<HTMLInputElement>(null);
+  const authSubmittingRef = useRef(false);
+  const creatingEventRef = useRef(false);
+  const keydownStateRef = useRef<any>(null);
+  const isPersistedId = (id?: string | null) => !!id && /^\d+$/.test(String(id));
   const [currentLabel, setCurrentLabel] = useState("");
   const [currentTime, setCurrentTime] = useState("");
   const [currentEndTime, setCurrentTimeEnd] = useState("");
   const [currentColor, setCurrentColor] = useState("#fbbf24");
   const [currentCategory, setCurrentCategory] = useState("其他");
+
+  const editingEventId = interaction.type === 'editing_event' ? interaction.eventId : null;
+  const editingBlockId = interaction.type === 'editing_block' ? interaction.blockId : null;
+  const pendingEvent = interaction.type === 'creating_event' ? { x: interaction.x!, y: interaction.y!, time: interaction.time! } : 
+                       interaction.type === 'editing_event' ? { x: dateToOffset(currentTime || '2014-01-01'), y: interaction.y!, time: currentTime || '2014-01-01' } : null;
+  const pendingBlock = interaction.type === 'creating_block' ? { startX: interaction.startX!, currentX: interaction.currentX!, y: interaction.y!, startTime: interaction.startTime!, endTime: interaction.endTime! } : 
+                       interaction.type === 'editing_block' ? { startX: dateToOffset(currentTime || '2014-01-01'), currentX: dateToOffset(currentEndTime || '2014-01-01'), y: interaction.y!, startTime: currentTime || '2014-01-01', endTime: currentEndTime || '2014-01-01' } : null;
+  const resizingBlock = interaction.type === 'resizing_block' ? { id: interaction.blockId!, edge: interaction.edge!, y: interaction.y! } : null;
+  const draggingElement = interaction.type === 'dragging_element' ? { elementType: interaction.elementType!, elementId: interaction.elementId!, offsetX: interaction.offsetX!, offsetY: interaction.offsetY! } : null;
+
+  const isEditingAny = () => interaction.type !== 'idle';
+
+  const setEditingEventId = (id: string | null) => {
+    if (id) setInteraction({ type: 'editing_event', eventId: id, y: events.find(e => e.id === id)?.y || 400 });
+    else if (interaction.type === 'editing_event') setInteraction({ type: 'idle' });
+  };
+  
+  const setEditingBlockId = (id: string | null | ((prev: string | null) => string | null)) => {
+    if (typeof id === 'function') {
+      const nextId = id(editingBlockId || null);
+      if (nextId) setInteraction({ type: 'editing_block', blockId: nextId });
+      else if (interaction.type === 'editing_block') setInteraction({ type: 'idle' });
+    } else {
+      if (id) setInteraction({ type: 'editing_block', blockId: id });
+      else if (interaction.type === 'editing_block') setInteraction({ type: 'idle' });
+    }
+  };
+
+  const setPendingEvent = (val: { x: number, y: number, time: string } | null) => {
+    if (val) setInteraction({ type: 'creating_event', ...val });
+    else if (interaction.type === 'creating_event') setInteraction({ type: 'idle' });
+  };
+
+  const setPendingBlock = (val: { startX: number, currentX: number, y: number, startTime: string, endTime: string } | null | ((prev: any) => any)) => {
+    if (typeof val === 'function') {
+      const nextVal = val(pendingBlock);
+      if (nextVal) setInteraction({ type: 'creating_block', ...nextVal });
+      else if (interaction.type === 'creating_block') setInteraction({ type: 'idle' });
+    } else {
+      if (val) setInteraction({ type: 'creating_block', ...val });
+      else if (interaction.type === 'creating_block') setInteraction({ type: 'idle' });
+    }
+  };
+
+  const setResizingBlock = (val: { id: string, edge: 'left' | 'right', y: number } | null) => {
+    if (val) setInteraction({ type: 'resizing_block', blockId: val.id, edge: val.edge, y: val.y });
+    else if (interaction.type === 'resizing_block') setInteraction({ type: 'idle' });
+  };
   
   const [authMode, setAuthMode] = useState<'login' | 'register' | null>(null);
   const [username, setUsername] = useState("");
@@ -147,7 +234,7 @@ export default function Home() {
   const [brushWidth, setBrushWidth] = useState(4);
   const [isErasing, setIsErasing] = useState(false);
   const [eraserTrail, setEraserTrail] = useState<StrokePoint[]>([]);
-  const [resizingBlock, setResizingBlock] = useState<{ id: string, edge: 'left' | 'right', y: number } | null>(null);
+  const [showCategoryDropdown, setShowCategoryDropdown] = useState(false);
 
   useEffect(() => {
     const d = new Date();
@@ -162,6 +249,12 @@ export default function Home() {
   }, []);
 
   const cancelEdit = () => {
+    if (editingBlockId || (pendingBlock && activeTool === 'block')) {
+      saveTimeBlock();
+    } else if (editingEventId || (pendingEvent && !editingBlockId)) {
+      saveEvent();
+    }
+    updateRecentColors(currentColor);
     setPendingEvent(null);
     setPendingBlock(null);
     setEditingEventId(null);
@@ -172,7 +265,13 @@ export default function Home() {
     setCurrentTimeEnd("");
     setCurrentColor("#fbbf24");
     setCurrentCategory("其他");
+    setShowCategoryDropdown(false);
   };
+
+  const [showStickerMenu, setShowStickerMenu] = useState(false);
+  const [currentSticker, setCurrentSticker] = useState('⭐');
+
+  const STICKERS_LIST = ["⭐", "🚩", "💡", "❗", "❓", "📌", "📍", "🎈", "👑", "🏆", "🚀", "🎯", "🎨", "🌈", "⚡", "🔥", "🎉", "💯"];
 
   const switchTool = (tool: 'select' | 'block' | 'point' | 'sticker' | 'import' | 'ai' | 'search' | 'draw' | 'eraser') => {
     setActiveTool(tool);
@@ -208,7 +307,8 @@ export default function Home() {
     }, 3000); // 3 seconds highlight
   };
 
-  const [undoStack, setUndoStack] = useState<CanvasEvent[][]>([]);
+  const [undoStack, setUndoStack] = useState<{ events: CanvasEvent[], timeBlocks: TimeBlock[], strokes: Stroke[], stickers: CanvasSticker[] }[]>([]);
+  const [recentColors, setRecentColors] = useState<string[]>(["#fbbf24", "#c084fc", "#2dd4bf", "#ef4444", "#3b82f6"]);
 
   const [showAiModal, setShowAiModal] = useState(false);
   const [aiInputType, setAiInputType] = useState<'text' | 'file' | 'url'>('text');
@@ -259,7 +359,7 @@ export default function Home() {
      if (aiExtractedEvents.length === 0) return;
      
      try {
-       pushToUndo(events);
+       pushToUndo(events, timeBlocks, strokes, stickers);
        const savedEvents: CanvasEvent[] = [];
        for (const ev of aiExtractedEvents) {
          const res = await fetch('/api/events', {
@@ -282,28 +382,51 @@ export default function Home() {
      }
    };
 
-  const pushToUndo = (currentEvents: CanvasEvent[]) => {
+  const pushToUndo = (currentEvents: CanvasEvent[], currentTimeBlocks: TimeBlock[], currentStrokes: Stroke[], currentStickers: CanvasSticker[]) => {
     setUndoStack(prev => {
-      const newStack = [...prev, currentEvents];
-      if (newStack.length > 20) return newStack.slice(1);
+      const newStack = [...prev, { events: currentEvents, timeBlocks: currentTimeBlocks, strokes: currentStrokes, stickers: currentStickers }];
+      if (newStack.length > 20) return newStack.slice(newStack.length - 20);
       return newStack;
     });
   };
 
   const [isMac, setIsMac] = useState(false);
+  const [rulerY, setRulerY] = useState(16);
+  const rulerDragOffsetRef = useRef(0);
+  const isDraggingRulerRef = useRef(false);
   useEffect(() => {
     setIsMac(navigator.platform.toUpperCase().indexOf('MAC') >= 0);
+  }, []);
+
+  useEffect(() => {
+    const handleWindowMouseMove = (e: MouseEvent) => {
+      if (!isDraggingRulerRef.current) return;
+      const rulerHeight = 84;
+      const minY = 8;
+      const maxY = Math.max(minY, window.innerHeight - rulerHeight - 8);
+      const nextTop = e.clientY - rulerDragOffsetRef.current;
+      setRulerY(Math.max(minY, Math.min(maxY, nextTop)));
+    };
+    const handleWindowMouseUp = () => {
+      isDraggingRulerRef.current = false;
+    };
+    window.addEventListener('mousemove', handleWindowMouseMove);
+    window.addEventListener('mouseup', handleWindowMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleWindowMouseMove);
+      window.removeEventListener('mouseup', handleWindowMouseUp);
+    };
   }, []);
 
   const handleUndo = async () => {
     if (undoStack.length === 0) return;
     
-    const lastEvents = undoStack[undoStack.length - 1];
+    const lastSnapshot = undoStack[undoStack.length - 1];
     const prevStack = undoStack.slice(0, -1);
     
     // Find what changed (specifically additions to restore deletions)
     const currentEventIds = new Set(events.map(e => e.id));
-    const eventsToRestore = lastEvents.filter(e => !currentEventIds.has(e.id));
+    const eventsToRestore = lastSnapshot.events.filter((e: CanvasEvent) => !currentEventIds.has(e.id));
     
     try {
       // Sync restored events back to DB
@@ -318,7 +441,8 @@ export default function Home() {
         });
       }
       
-      setEvents(lastEvents);
+      setEvents(lastSnapshot.events);
+      setTimeBlocks(lastSnapshot.timeBlocks);
       setUndoStack(prevStack);
     } catch (err) {
       console.error("Undo sync failed:", err);
@@ -326,16 +450,106 @@ export default function Home() {
     }
   };
 
+  keydownStateRef.current = {
+    editingEventId,
+    pendingEvent,
+    editingBlockId,
+    pendingBlock,
+    activeTool,
+    showAiModal,
+    isAiProcessing,
+    authMode,
+    showStickerMenu,
+    showCategoryDropdown,
+    isSearchExpanded,
+    isPanning,
+    currentStroke,
+    isErasing,
+    resizingBlock,
+    draggingElement,
+    handleUndo,
+    cancelEdit
+  };
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      const s = keydownStateRef.current;
+      if (!s) return;
+
+      // 撤销快捷键
       if ((e.metaKey || e.ctrlKey) && e.key === 'z') {
         e.preventDefault();
-        handleUndo();
+        s.handleUndo();
+      }
+      
+      // 全局 Enter 保存（当存在待保存的编辑状态时），关闭编辑弹窗
+      if (e.key === 'Enter') {
+        if (s.editingEventId || (s.pendingEvent && !s.editingBlockId) || s.editingBlockId || (s.pendingBlock && s.activeTool === 'block')) {
+          e.preventDefault();
+          s.cancelEdit();
+        }
+      }
+
+      // 全局 Esc 退出当前操作
+      if (e.key === 'Escape') {
+        e.preventDefault();
+
+        // 先关闭顶层模态窗口
+        if (s.showAiModal) {
+          if (!s.isAiProcessing) setShowAiModal(false);
+          return;
+        }
+        if (s.authMode) {
+          setAuthMode(null);
+          return;
+        }
+
+        // 关闭各类次级 UI
+        if (s.showStickerMenu) setShowStickerMenu(false);
+        if (s.showCategoryDropdown) setShowCategoryDropdown(false);
+        if (s.isSearchExpanded) setIsSearchExpanded(false);
+
+        // 清理长按拖拽定时器
+        if (dragPressTimerRef.current) {
+          clearTimeout(dragPressTimerRef.current);
+          dragPressTimerRef.current = null;
+        }
+
+        // 结束平移
+        if (s.isPanning) setIsPanning(false);
+
+        // 结束画笔（不保存未完成笔迹）
+        if (s.currentStroke) setCurrentStroke(null);
+
+        // 结束橡皮擦，并同步已擦除的对象到后端
+        if (s.isErasing) {
+          setIsErasing(false);
+          setEraserTrail([]);
+
+          if (deletedStrokeIdsRef.current.size > 0) {
+            deletedStrokeIdsRef.current.forEach(id => {
+              fetch(`/api/strokes?id=${id}`, { method: 'DELETE' }).catch(err => console.error('Error deleting stroke:', err));
+            });
+            deletedStrokeIdsRef.current.clear();
+          }
+
+          if (deletedStickerIdsRef.current.size > 0) {
+            deletedStickerIdsRef.current.forEach(id => {
+              fetch(`/api/stickers?id=${id}`, { method: 'DELETE' }).catch(err => console.error('Error deleting sticker:', err));
+            });
+            deletedStickerIdsRef.current.clear();
+          }
+        }
+
+        // 若存在编辑/创建/拉伸/拖拽状态，统一退出
+        if (s.editingEventId || s.editingBlockId || s.pendingEvent || s.pendingBlock || s.resizingBlock || s.draggingElement) {
+          s.cancelEdit();
+        }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [undoStack, events, currentUser]); // Added missing dependencies and kept it stable
+  }, []);
 
   useEffect(() => {
     // 阻止各个浏览器（Chrome, Safari, Firefox 等）在触控板双指捏合时触发整个网页的原生缩放或前进后退
@@ -355,6 +569,7 @@ export default function Home() {
   }, []);
 
   const currentZoom = ZOOM_LEVELS[zoomIndex];
+  const rulerMaterial = RULER_MATERIAL;
   const pixelsPerYear = useMemo(() => {
     if (windowSize.width === 0) return 600;
     return windowSize.width / currentZoom.yearsVisible;
@@ -392,16 +607,9 @@ export default function Home() {
   }, []);
 
   const isOverlappingTimeBlock = useCallback((row: number, start: number, end: number, ignoreId?: string) => {
-    if (!(end > start)) return false;
-    for (const block of timeBlocks) {
-      if (block.y !== row) continue;
-      if (ignoreId && block.id === ignoreId) continue;
-      const r = getTimeBlockRange(block);
-      if (!(r.end > r.start)) continue;
-      if (start < r.end && r.start < end) return true;
-    }
+    // 移除了时间块的重叠检测逻辑，现在允许时间块在同一个 y 轴位置任意重叠
     return false;
-  }, [getTimeBlockRange, timeBlocks]);
+  }, []);
 
   const findTimeBlockAtCell = useCallback((row: number, yearOffset: number) => {
     for (const block of timeBlocks) {
@@ -413,10 +621,9 @@ export default function Home() {
   }, [getTimeBlockRange, timeBlocks]);
 
   const openTimeBlockEditor = useCallback((block: TimeBlock) => {
-    setEditingBlockId(block.id);
-    setEditingEventId(null);
-    setPendingEvent(null);
-    setPendingBlock({
+    setInteraction({
+      type: 'editing_block',
+      blockId: block.id,
       startX: dateToOffset(block.startTime),
       currentX: dateToOffset(block.endTime),
       y: block.y,
@@ -443,8 +650,17 @@ export default function Home() {
 
     for (let y = startYearOffset - 1; y <= endYearOffset + 1; y++) {
       if (y % yearStep === 0) {
+        const absoluteYear = 2014 + y;
         const x = offset.x + y * pixelsPerYear;
-        ticks.push({ type: 'year', value: 2014 + y, x });
+        const showYearTick = currentZoom.level === 9
+          ? (absoluteYear - 2026) % 5 === 0
+          : currentZoom.level === 8
+            ? (absoluteYear - 2026) % 3 === 0
+            : currentZoom.level === 7
+              ? (absoluteYear - 2026) % 2 === 0
+              : true;
+
+        ticks.push({ type: showYearTick ? 'year' : 'year_minor', value: absoluteYear, x });
         if (currentZoom.tickType === 'month') {
           for (let m = 1; m < 12; m++) {
             ticks.push({ type: 'month', value: MONTHS[m], x: x + (m / 12) * pixelsPerYear });
@@ -452,6 +668,11 @@ export default function Home() {
         } else if (currentZoom.tickType === 'quarter') {
           for (let q = 1; q < 4; q++) {
             ticks.push({ type: 'quarter', value: `Q${q+1}`, x: x + (q * 3 / 12) * pixelsPerYear });
+          }
+        } else if (currentZoom.level === 6) {
+          // Level 6 keeps yearly labels but adds quarter supplementary ticks between years.
+          for (let q = 1; q < 4; q++) {
+            ticks.push({ type: 'quarter_minor', value: `Q${q+1}`, x: x + (q * 3 / 12) * pixelsPerYear });
           }
         }
       }
@@ -469,11 +690,13 @@ export default function Home() {
     // Position the timeline so that 2014 is visible near the left
     setOffset({ x: 100, y: 50 });
     
-    // Fetch events from the database API
-    const fetchEvents = async () => {
-      // If NOT logged in, show initial demo events
+    // Fetch events, timeblocks, and strokes from the database API
+    const fetchData = async () => {
+      // If NOT logged in, show initial demo events and empty blocks/strokes
       if (!isLoggedIn) {
         setEvents(INITIAL_EVENTS);
+        setTimeBlocks([]);
+        setStrokes([]);
         return;
       }
       
@@ -483,41 +706,90 @@ export default function Home() {
       }
 
       try {
-        const res = await fetch(`/api/events?userId=${currentUser.id}`);
-        if (!res.ok) throw new Error('DB Fetch failed');
-        const dbEvents = await res.json();
-        
-        if (dbEvents && dbEvents.length > 0) {
-          // If we have DB events, use them.
-          const processedDbEvents = dbEvents.map((ev: CanvasEvent, index: number) => ({
+        // Fetch Events
+        const resEvents = await fetch(`/api/events?userId=${currentUser.id}`);
+        if (resEvents.ok) {
+          const dbEvents = await resEvents.json();
+          if (dbEvents && dbEvents.length > 0) {
+            const processedDbEvents = dbEvents.map((ev: CanvasEvent, index: number) => ({
               ...ev,
-              y: ev.y || (400 + (index % 3) * 50) // Fallback Y if missing
+              y: ev.y || (400 + (index % 3) * 50)
             }));
-          setEvents(processedDbEvents);
+            setEvents(processedDbEvents);
+          } else {
+            setEvents([]);
+          }
         } else {
-          setEvents([]); // Strictly show empty if logged in but no events in DB
+          setEvents([]);
         }
+
+        // Fetch TimeBlocks
+        const resBlocks = await fetch(`/api/timeblocks?userId=${currentUser.id}`);
+        if (resBlocks.ok) {
+          const dbBlocks = await resBlocks.json();
+          setTimeBlocks(dbBlocks && dbBlocks.length > 0 ? dbBlocks : []);
+        }
+
+        // Fetch Strokes
+        const resStrokes = await fetch(`/api/strokes?userId=${currentUser.id}`);
+        if (resStrokes.ok) {
+          const dbStrokes = await resStrokes.json();
+          setStrokes(dbStrokes && dbStrokes.length > 0 ? dbStrokes : []);
+        }
+
+        // Fetch Stickers
+        const resStickers = await fetch(`/api/stickers?userId=${currentUser.id}`);
+        if (resStickers.ok) {
+          const dbStickers = await resStickers.json();
+          setStickers(dbStickers && dbStickers.length > 0 ? dbStickers : []);
+        }
+
       } catch (err) {
-        console.error("Failed to fetch events from DB, using fallback.", err);
-        setEvents([]); // Better to show empty than leak INITIAL_EVENTS to a user
+        console.error("Failed to fetch data from DB, using fallback.", err);
+        setEvents([]);
+        setTimeBlocks([]);
+        setStrokes([]);
+        setStickers([]);
       }
     };
     
-    fetchEvents();
+    fetchData();
     
     return () => window.removeEventListener("resize", updateSize);
   }, [isLoggedIn, currentUser]); // Added currentUser to dependencies
 
   const handleLogin = async () => {
+    if (isLoading || authSubmittingRef.current) return;
+    authSubmittingRef.current = true;
+    setIsLoading(true);
     setLoginError("");
+    
+    // Check for empty fields
+    if (!username.trim()) {
+      setLoginError("用户名不能为空");
+      setIsLoading(false);
+      authSubmittingRef.current = false;
+      return;
+    }
+    if (!password) {
+      setLoginError("密码不能为空");
+      setIsLoading(false);
+      authSubmittingRef.current = false;
+      return;
+    }
+
     try {
       if (authMode === 'register') {
-        if (!email.includes('@')) {
+        if (!email.trim() || !email.includes('@')) {
           setLoginError("请输入有效的邮箱地址");
+          setIsLoading(false);
+          authSubmittingRef.current = false;
           return;
         }
         if (password !== confirmPassword) {
           setLoginError("两次输入的密码不一致");
+          setIsLoading(false);
+          authSubmittingRef.current = false;
           return;
         }
       }
@@ -553,6 +825,9 @@ export default function Home() {
     } catch (err) {
       console.error('Auth error detail:', err);
       setLoginError('服务器连接失败');
+    } finally {
+      setIsLoading(false);
+      authSubmittingRef.current = false;
     }
   };
 
@@ -607,10 +882,48 @@ export default function Home() {
     setOffset(prev => ({ ...prev, x: mouseX - timeAtMouse * nextPixelsPerYear }));
   };
 
-  const handleMouseDown = (e: React.MouseEvent) => {
-    if ((e.target as HTMLElement).closest('.editing-popup')) return;
+  const isCreatingBlockRef = useRef(false);
+  const blockCreateStartRef = useRef<{ startX: number; row: number; startTime: string } | null>(null);
+  const skipNextCanvasClickRef = useRef(false);
+  const dragPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isUiInteractiveTarget = (target: EventTarget | null) =>
+    target instanceof Element && !!target.closest('.ui-interactive');
+  const isEditingPopupTarget = (target: EventTarget | null) =>
+    target instanceof Element && !!target.closest('.editing-popup');
+  const scheduleDragStart = (
+    elementType: 'event' | 'block',
+    elementId: string,
+    e: React.MouseEvent
+  ) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const rawYearOffset = (e.clientX - rect.left - offset.x) / pixelsPerYear;
+    const canvasY = e.clientY - rect.top - offset.y;
 
-    if (e.button === 1 || (e.button === 0 && (e.altKey || e.ctrlKey)) || activeTool === 'select') { 
+    if (dragPressTimerRef.current) {
+      clearTimeout(dragPressTimerRef.current);
+    }
+
+    dragPressTimerRef.current = setTimeout(() => {
+      pushToUndo(events, timeBlocks, strokes, stickers);
+      setInteraction({
+        type: 'dragging_element',
+        elementType,
+        elementId,
+        offsetX: rawYearOffset,
+        offsetY: canvasY
+      });
+      dragPressTimerRef.current = null;
+    }, 220);
+  };
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    const target = e.target;
+    if (!(target instanceof Element)) return;
+    if (isEditingPopupTarget(target) || isUiInteractiveTarget(target)) return;
+    if (authMode || showAiModal) return;
+
+    if (e.button === 1 || (e.button === 0 && (e.altKey || e.ctrlKey)) || (activeTool === 'select' && !target.closest('.draggable-element'))) { 
       setIsPanning(true);
       e.preventDefault();
     } else if (e.button === 0 && activeTool === 'draw') {
@@ -618,11 +931,14 @@ export default function Home() {
       if (rect) {
         const rawYearOffset = (e.clientX - rect.left - offset.x) / pixelsPerYear;
         const canvasY = (e.clientY - rect.top - offset.y);
+        pushToUndo(events, timeBlocks, strokes, stickers);
         setCurrentStroke({ id: Math.random().toString(36).slice(2, 11), color: currentColor, width: brushWidth, points: [{ x: rawYearOffset, y: canvasY }] });
       }
       return;
     } else if (e.button === 0 && activeTool === 'eraser') {
       setIsErasing(true);
+      deletedStrokeIdsRef.current.clear();
+      deletedStickerIdsRef.current.clear();
       const rect = containerRef.current?.getBoundingClientRect();
       if (rect) {
         const canvasX = e.clientX - rect.left - offset.x;
@@ -630,7 +946,7 @@ export default function Home() {
         setEraserTrail([{ x: canvasX, y: canvasY }]);
       }
       return;
-    } else if (e.button === 0 && !pendingEvent && !editingEventId && !editingBlockId && !pendingBlock) {
+    } else if (e.button === 0 && (activeTool === 'block' || !isEditingAny())) {
       const rect = containerRef.current?.getBoundingClientRect();
       if (!rect) return;
 
@@ -643,24 +959,49 @@ export default function Home() {
         const row = Math.floor(canvasY / 60);
         const existing = findTimeBlockAtCell(row, yearOffset);
         if (existing) {
+          blockCreateStartRef.current = null;
           openTimeBlockEditor(existing);
           return;
         }
-        setCurrentColor("#fbbf24");
-        setCurrentCategory("其他");
-        setPendingBlock({
-          startX: yearOffset,
-          currentX: yearOffset,
-          y: row,
-          startTime: timeStr,
-          endTime: timeStr
-        });
+        // Block mode rule: while editing, do not create another block.
+        if (isEditingAny()) return;
+        // Arm creation first, and start only when the cursor actually drags.
+        blockCreateStartRef.current = { startX: yearOffset, row, startTime: timeStr };
+        return;
       }
     }
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
-    if (resizingBlock) {
+    if (draggingElement) {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect) {
+        const canvasY = (e.clientY - rect.top - offset.y);
+
+        if (draggingElement.elementType === 'event') {
+          setEvents(prev => prev.map(ev => {
+            if (ev.id === draggingElement.elementId) {
+              return { ...ev, y: canvasY };
+            }
+            return ev;
+          }));
+          if (editingEventId === draggingElement.elementId) {
+            setInteraction(prev => ({ ...prev, y: canvasY }));
+          }
+        } else if (draggingElement.elementType === 'block') {
+          const row = Math.floor(canvasY / 60);
+          setTimeBlocks(prev => prev.map(b => {
+            if (b.id === draggingElement.elementId) {
+              return { ...b, y: row };
+            }
+            return b;
+          }));
+          if (editingBlockId === draggingElement.elementId) {
+            setInteraction(prev => ({ ...prev, y: row }));
+          }
+        }
+      }
+    } else if (resizingBlock) {
       const rect = containerRef.current?.getBoundingClientRect();
       if (rect) {
         const rawYearOffset = (e.clientX - rect.left - offset.x) / pixelsPerYear;
@@ -705,16 +1046,37 @@ export default function Home() {
         
         setEraserTrail(prev => [...prev, { x: canvasX, y: canvasY }]);
 
-        setStrokes(prevStrokes => prevStrokes.filter(stroke => {
-          const hit = stroke.points.some(p => {
+        const hitStrokes = strokes.filter(stroke => {
+          return stroke.points.some(p => {
             const px = p.x * pixelsPerYear;
             const py = p.y;
-            // 距离计算，如果橡皮擦半径是 30
-            const dist = Math.sqrt(Math.pow(px - canvasX, 2) + Math.pow(py - canvasY, 2));
-            return dist < 30;
+            return Math.sqrt(Math.pow(px - canvasX, 2) + Math.pow(py - canvasY, 2)) < 30;
           });
-          return !hit; // 没碰到的保留
-        }));
+        });
+
+        if (hitStrokes.length > 0) {
+          const newHits = hitStrokes.filter(s => !deletedStrokeIdsRef.current.has(s.id));
+          if (newHits.length > 0) {
+            pushToUndo(events, timeBlocks, strokes, stickers);
+            newHits.forEach(s => deletedStrokeIdsRef.current.add(s.id));
+            setStrokes(prev => prev.filter(s => !deletedStrokeIdsRef.current.has(s.id)));
+          }
+        }
+
+        const hitStickers = stickers.filter(s => {
+          const px = dateToOffset(s.time) * pixelsPerYear;
+          const py = s.y;
+          return Math.sqrt(Math.pow(px - canvasX, 2) + Math.pow(py - canvasY, 2)) < 40;
+        });
+
+        if (hitStickers.length > 0) {
+          const newHits = hitStickers.filter(s => !deletedStickerIdsRef.current.has(s.id));
+          if (newHits.length > 0) {
+            pushToUndo(events, timeBlocks, strokes, stickers);
+            newHits.forEach(s => deletedStickerIdsRef.current.add(s.id));
+            setStickers(prev => prev.filter(s => !deletedStickerIdsRef.current.has(s.id)));
+          }
+        }
       }
     } else if (isPanning) {
       setOffset(prev => ({ x: prev.x + e.movementX, y: prev.y + e.movementY }));
@@ -733,26 +1095,132 @@ export default function Home() {
           endTime
         } : null);
       }
+    } else if (activeTool === 'block' && blockCreateStartRef.current && !editingBlockId) {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect) {
+        const rawYearOffset = (e.clientX - rect.left - offset.x) / pixelsPerYear;
+        const yearOffset = snapYearOffsetToGrid(rawYearOffset);
+        const armed = blockCreateStartRef.current;
+        if (yearOffset !== armed.startX) {
+          isCreatingBlockRef.current = true;
+          setCurrentColor("#fbbf24");
+          setCurrentCategory("其他");
+          setCurrentLabel(getNextTimeBlockLabel());
+          setInteraction({
+            type: 'creating_block',
+            startX: armed.startX,
+            currentX: yearOffset,
+            y: armed.row,
+            startTime: armed.startTime,
+            endTime: offsetToDate(yearOffset)
+          });
+          blockCreateStartRef.current = null;
+        }
+      }
     }
   };
 
-  const handleMouseUp = () => {
+  const handleMouseUp = async () => {
+    if (dragPressTimerRef.current) {
+      clearTimeout(dragPressTimerRef.current);
+      dragPressTimerRef.current = null;
+    }
+
+    if (draggingElement) {
+      if (draggingElement.elementType === 'event') {
+        const ev = events.find(e => e.id === draggingElement.elementId);
+        if (ev) {
+          try {
+            await fetch('/api/events', {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ...ev, userId: currentUser?.id }),
+            });
+          } catch (err) {
+            console.error("Failed to update event position in DB", err);
+          }
+        }
+      } else if (draggingElement.elementType === 'block') {
+        const block = timeBlocks.find(b => b.id === draggingElement.elementId);
+        if (block) {
+          try {
+            await fetch('/api/timeblocks', {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(block),
+            });
+          } catch (err) {
+            console.error("Failed to update block position in DB", err);
+          }
+        }
+      }
+      setInteraction({ type: 'idle' });
+      return;
+    }
     if (resizingBlock) {
-      setResizingBlock(null);
+      // 拖拽调整边缘结束时，保存修改到数据库
+      const block = timeBlocks.find(b => b.id === resizingBlock.id);
+      if (block) {
+        try {
+          await fetch('/api/timeblocks', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(block),
+          });
+        } catch (err) {
+          console.error("Failed to update block size in DB", err);
+        }
+      }
+      if (block) {
+        setInteraction({ type: 'editing_block', blockId: block.id, y: block.y });
+      } else {
+        setResizingBlock(null);
+      }
       return;
     }
     if (currentStroke) {
       setStrokes(prev => [...prev, currentStroke]);
+      // Save stroke to DB
+      try {
+        const res = await fetch('/api/strokes', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...currentStroke, userId: currentUser?.id })
+        });
+        const data = await res.json();
+        // Update the stroke with the real DB id
+        if (data.success && data.id) {
+          setStrokes(prev => prev.map(s => s.id === currentStroke.id ? { ...s, id: data.id.toString() } : s));
+        }
+      } catch (err) {
+        console.error("Save stroke error:", err);
+      }
       setCurrentStroke(null);
     }
     if (isErasing) {
       setIsErasing(false);
       setEraserTrail([]);
+      
+      // Sync deletions to database
+      if (deletedStrokeIdsRef.current.size > 0) {
+        deletedStrokeIdsRef.current.forEach(id => {
+          fetch(`/api/strokes?id=${id}`, { method: 'DELETE' }).catch(err => console.error('Error deleting stroke:', err));
+        });
+        deletedStrokeIdsRef.current.clear();
+      }
+      
+      if (deletedStickerIdsRef.current.size > 0) {
+        deletedStickerIdsRef.current.forEach(id => {
+          fetch(`/api/stickers?id=${id}`, { method: 'DELETE' }).catch(err => console.error('Error deleting sticker:', err));
+        });
+        deletedStickerIdsRef.current.clear();
+      }
     }
 
     if (isPanning) {
       setIsPanning(false);
     } else if (pendingBlock && activeTool === 'block' && !editingBlockId) {
+      blockCreateStartRef.current = null;
       const startTime = pendingBlock.startTime;
       let endTime = pendingBlock.endTime;
       if (startTime === endTime) {
@@ -767,35 +1235,74 @@ export default function Home() {
         endTime = end.toISOString().split('T')[0];
       }
 
-      const startOffset = dateToOffset(startTime);
-      const endOffset = dateToOffset(endTime);
-      const rangeStart = Math.min(startOffset, endOffset);
-      const rangeEnd = Math.max(startOffset, endOffset);
-      if (isOverlappingTimeBlock(pendingBlock.y, rangeStart, rangeEnd)) {
-        alert('时间块不能重叠');
-        setPendingBlock(null);
-        return;
-      }
-
-      const label = getNextTimeBlockLabel();
-      const newBlock: TimeBlock = {
-        id: Math.random().toString(36).slice(2, 11),
+      const label = currentLabel || getNextTimeBlockLabel();
+      const newBlockData = {
         startTime,
         endTime,
         label,
         color: currentColor,
         category: currentCategory,
         y: pendingBlock.y,
+        userId: currentUser?.id
       };
+
+      pushToUndo(events, timeBlocks, strokes, stickers);
+      
+      // 乐观更新 UI，立即创建
+      const tempId = Math.random().toString(36).substr(2, 9);
+      const newBlock: TimeBlock = { ...newBlockData, id: tempId };
       setTimeBlocks(prev => [...prev, newBlock]);
-      setPendingBlock(null);
-      setEditingBlockId(null);
-      setEditingEventId(null);
-      setPendingEvent(null);
+      
+      // 自动进入编辑状态
+      openTimeBlockEditor(newBlock);
+      // Prevent the trailing click (after mouseup) from immediately canceling this fresh edit session.
+      skipNextCanvasClickRef.current = true;
+
+      // 后台同步到数据库
+      fetch('/api/timeblocks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newBlockData),
+      })
+      .then(res => res.json())
+      .then(data => {
+        if (data.success && data.id) {
+          const realId = data.id.toString();
+          // 替换为真实的数据库 ID
+          setTimeBlocks(prev => prev.map(b => b.id === tempId ? { ...b, id: realId } : b));
+          // 如果当前还在编辑这个块，也要更新 editingBlockId
+          setEditingBlockId(prev => prev === tempId ? realId : prev);
+
+          // If user has edited fields while waiting for POST, sync latest editor state to DB once real ID is available.
+          fetch('/api/timeblocks', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id: realId,
+              startTime: currentTime || newBlockData.startTime,
+              endTime: currentEndTime || newBlockData.endTime,
+              label: (currentLabel || newBlockData.label).trim(),
+              color: currentColor || newBlockData.color,
+              category: currentCategory || newBlockData.category
+            }),
+          }).catch(err => console.error("Sync block after ID mapping error:", err));
+        }
+      })
+      .catch(err => console.error("Save block error:", err));
+    } else if (activeTool === 'block' && blockCreateStartRef.current) {
+      // Click without dragging in block mode should not create a block.
+      blockCreateStartRef.current = null;
     }
   };
 
   const handleCanvasClick = (e: React.MouseEvent) => {
+    if (skipNextCanvasClickRef.current) {
+      skipNextCanvasClickRef.current = false;
+      return;
+    }
+    const target = e.target;
+    if (!(target instanceof Element)) return;
+    if (isUiInteractiveTarget(target)) return;
     if (isPanning || resizingBlock) return;
     if (authMode) {
       setAuthMode(null);
@@ -804,36 +1311,26 @@ export default function Home() {
 
     if (activeTool === 'draw' || activeTool === 'eraser') return;
 
-    // 只有在点或方块模式下才允许通过点击创建
-    if (activeTool !== 'point' && activeTool !== 'block') {
-      if (pendingEvent || editingEventId || pendingBlock || editingBlockId) {
+    if (isCreatingBlockRef.current) {
+      isCreatingBlockRef.current = false;
+      return;
+    }
+
+    // 只有在点、方块或贴纸模式下才允许通过点击创建
+    if (activeTool !== 'point' && activeTool !== 'block' && activeTool !== 'sticker') {
+      if (isEditingAny()) {
         cancelEdit();
       }
       return;
     }
 
-    if (e.button === 0 && !e.altKey && !e.ctrlKey && activeTool === 'block') {
-      const rect = containerRef.current?.getBoundingClientRect();
-      if (rect) {
-        const rawYearOffset = (e.clientX - rect.left - offset.x) / pixelsPerYear;
-        const yearOffset = snapYearOffsetToGrid(rawYearOffset);
-        const canvasY = (e.clientY - rect.top - offset.y);
-        const row = Math.floor(canvasY / 60);
-        const existing = findTimeBlockAtCell(row, yearOffset);
-        if (existing) {
-          openTimeBlockEditor(existing);
-          return;
-        }
-      }
-    }
-
-    if ((e.target as HTMLElement).closest('rect') || (e.target as HTMLElement).closest('circle')) {
+    if ((e.target as HTMLElement).closest('rect') || (e.target as HTMLElement).closest('circle') || (e.target as HTMLElement).closest('text')) {
       return;
     }
 
     if (e.button === 0 && !e.altKey && !e.ctrlKey) {
       // 如果当前已经在编辑状态，点击空白处则取消
-      if (pendingEvent || editingEventId || pendingBlock || editingBlockId) {
+      if (isEditingAny()) {
         cancelEdit();
         return;
       }
@@ -846,49 +1343,107 @@ export default function Home() {
         
         if (activeTool === 'point') {
           // 初始化点事件创建状态
-          setPendingEvent({ x: yearOffset, y: canvasY, time: timeStr });
-          setEditingEventId(null);
+          setInteraction({ type: 'creating_event', x: yearOffset, y: canvasY, time: timeStr });
           setCurrentLabel("新事件");
           setCurrentTime(timeStr);
           setCurrentTimeEnd(timeStr);
           setCurrentColor("#fbbf24");
           setCurrentCategory("其他");
+        } else if (activeTool === 'sticker') {
+          pushToUndo(events, timeBlocks, strokes, stickers);
+          const newStickerData = { emoji: currentSticker, time: timeStr, y: canvasY, userId: currentUser?.id || null };
+          const tempId = Math.random().toString(36).substr(2, 9);
+          setStickers(prev => [...prev, { ...newStickerData, id: tempId }]);
+
+          fetch('/api/stickers', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(newStickerData),
+          })
+          .then(res => res.json())
+          .then(data => {
+            if (data.success && data.id) {
+              setStickers(prev => prev.map(s => s.id === tempId ? { ...s, id: data.id.toString() } : s));
+            }
+          })
+          .catch(err => console.error("Save sticker error:", err));
         }
         // 注意：方块模式的初始化主要在 handleMouseDown/Up 中处理
       }
     }
   };
 
+  const updateRecentColors = (newColor: string) => {
+    setRecentColors(prev => {
+      // 只有在最终保存（或者关闭颜色选择器）时，或者新颜色确实不在最近颜色中时，我们才更新
+      // 但为了简单和用户体验，我们依然允许它更新，只是做个轻量级去重
+      // 如果最新一个颜色和新颜色一样，就不需要频繁插入
+      if (prev[0] === newColor) return prev;
+      
+      const filtered = prev.filter(c => c !== newColor);
+      return [newColor, ...filtered].slice(0, 5);
+    });
+  };
+
+  const handleColorChange = (c: string) => {
+    setCurrentColor(c);
+  };
+
   const startEditing = (event: CanvasEvent) => {
-    setEditingBlockId(null);
-    setPendingBlock(null);
-    setPendingEvent({ x: dateToOffset(event.time), y: event.y, time: event.time });
-    setEditingEventId(event.id);
+    setInteraction({ type: 'editing_event', eventId: event.id, y: event.y });
     setCurrentLabel(event.label);
     setCurrentTime(event.time);
     setCurrentTimeEnd(event.time);
     setCurrentColor(event.color);
+    updateRecentColors(event.color);
     setCurrentCategory("其他");
   };
 
-  const saveEvent = async () => {
-    if (!currentLabel.trim() || !currentTime) {
-      cancelEdit();
+  const saveEvent = async (overrideTime?: string, overrideLabel?: string, overrideColor?: string, overrideCategory?: string) => {
+    const timeToSave = overrideTime || currentTime;
+    const labelToSave = overrideLabel || currentLabel;
+    const colorToSave = overrideColor || currentColor;
+
+    if (!labelToSave.trim() || !timeToSave) {
       return;
     }
 
     try {
       if (editingEventId) {
-        // Optional: Implement PUT /api/events for editing
+        const existingEvent = events.find(e => e.id === editingEventId);
+        // Only update if there are actual changes
+        if (existingEvent && existingEvent.label === labelToSave.trim() && existingEvent.time === timeToSave && existingEvent.color === colorToSave) {
+          return;
+        }
+
+        const updateData = {
+          id: editingEventId,
+          label: labelToSave.trim(),
+          time: timeToSave,
+          color: colorToSave,
+          y: existingEvent?.y || 400,
+          userId: currentUser?.id
+        };
+
+        const res = await fetch('/api/events', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updateData),
+        });
+
+        if (!res.ok) throw new Error('Failed to update event in DB');
+
         setEvents(prev => prev.map(ev => 
-          ev.id === editingEventId ? { ...ev, label: currentLabel.trim(), time: currentTime, color: currentColor } : ev
+          ev.id === editingEventId ? { ...ev, label: labelToSave.trim(), time: timeToSave, color: colorToSave } : ev
         ));
       } else if (pendingEvent) {
+        if (creatingEventRef.current) return;
+        creatingEventRef.current = true;
         const newEventData = {
-          time: currentTime,
+          time: timeToSave,
           y: pendingEvent.y,
-          label: currentLabel.trim(),
-          color: currentColor,
+          label: labelToSave.trim(),
+          color: colorToSave,
           userId: currentUser?.id
         };
 
@@ -906,18 +1461,20 @@ export default function Home() {
           id: data.id.toString(),
         };
         setEvents(prev => [...prev, newEvent]);
+        // Remove pendingEvent to transition to editing state
+        setInteraction({ type: 'editing_event', eventId: newEvent.id, y: newEvent.y });
+        creatingEventRef.current = false;
       }
     } catch (err) {
       console.error('Error saving event:', err);
-      alert('保存事件失败，请检查数据库连接');
+      creatingEventRef.current = false;
     }
-    cancelEdit();
   };
 
   const deleteEvent = async () => {
     if (editingEventId) {
       try {
-        pushToUndo(events);
+        pushToUndo(events, timeBlocks, strokes, stickers);
         const res = await fetch(`/api/events?id=${editingEventId}`, {
           method: 'DELETE',
         });
@@ -932,54 +1489,93 @@ export default function Home() {
     }
   };
 
-  const saveTimeBlock = async () => {
-    if (!currentLabel.trim() || !currentTime || !currentEndTime) {
-      cancelEdit();
+  const saveTimeBlock = async (overrideStartTime?: string, overrideEndTime?: string, overrideLabel?: string, overrideColor?: string, overrideCategory?: string) => {
+    const startTimeToSave = overrideStartTime || currentTime;
+    const endTimeToSave = overrideEndTime || currentEndTime;
+    const labelToSave = overrideLabel || currentLabel;
+    const colorToSave = overrideColor || currentColor;
+    const categoryToSave = overrideCategory || currentCategory;
+
+    if (!labelToSave.trim() || !startTimeToSave || !endTimeToSave) {
       return;
     }
 
     const fallbackRow = Math.floor(400 / 60);
     const newBlockData = {
-      startTime: currentTime,
-      endTime: currentEndTime,
-      label: currentLabel.trim(),
-      color: currentColor,
-      category: currentCategory,
-      y: editingBlockId ? (timeBlocks.find(b => b.id === editingBlockId)?.y ?? fallbackRow) : (pendingBlock?.y ?? fallbackRow)
+      startTime: startTimeToSave,
+      endTime: endTimeToSave,
+      label: labelToSave.trim(),
+      color: colorToSave,
+      category: categoryToSave,
+      y: editingBlockId ? (timeBlocks.find(b => b.id === editingBlockId)?.y ?? fallbackRow) : (pendingBlock?.y ?? fallbackRow),
+      userId: currentUser?.id
     };
 
-    const startOffset = dateToOffset(newBlockData.startTime);
-    const endOffset = dateToOffset(newBlockData.endTime);
-    const rangeStart = Math.min(startOffset, endOffset);
-    const rangeEnd = Math.max(startOffset, endOffset);
-    if (isOverlappingTimeBlock(newBlockData.y, rangeStart, rangeEnd, editingBlockId ?? undefined)) {
-      alert('时间块不能重叠');
-      return;
-    }
-
     try {
-      // TODO: 实现后端 API 支持 TimeBlock
-      // const res = await fetch('/api/timeblocks', { ... });
-      
       if (editingBlockId) {
+        // If the block is still using a temporary client ID, update local state only.
+        // The backend sync will be completed after the real DB ID is returned.
+        if (!isPersistedId(editingBlockId)) {
+          setTimeBlocks(prev => prev.map(b => b.id === editingBlockId ? { ...b, ...newBlockData } : b));
+          return;
+        }
+
+        const existingBlock = timeBlocks.find(b => b.id === editingBlockId);
+        if (existingBlock && existingBlock.startTime === startTimeToSave && existingBlock.endTime === endTimeToSave && existingBlock.label === labelToSave.trim() && existingBlock.color === colorToSave && existingBlock.category === categoryToSave) {
+          return;
+        }
+
+        await fetch('/api/timeblocks', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...newBlockData, id: editingBlockId }),
+        });
+        
         setTimeBlocks(prev => prev.map(b => b.id === editingBlockId ? { ...b, ...newBlockData } : b));
       } else {
+        const res = await fetch('/api/timeblocks', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(newBlockData),
+        });
+        const data = await res.json();
+        
         const newBlock: TimeBlock = {
           ...newBlockData,
-          id: Math.random().toString(36).substr(2, 9),
+          id: data.id ? data.id.toString() : Math.random().toString(36).substr(2, 9),
         };
         setTimeBlocks(prev => [...prev, newBlock]);
+        setInteraction({ type: 'editing_block', blockId: newBlock.id });
       }
     } catch (err) {
       console.error('Error saving time block:', err);
     }
-    cancelEdit();
   };
 
-  const deleteTimeBlock = () => {
+  const deleteTimeBlock = async () => {
     if (editingBlockId) {
-      setTimeBlocks(prev => prev.filter(b => b.id !== editingBlockId));
-      cancelEdit();
+      try {
+        pushToUndo(events, timeBlocks, strokes, stickers);
+        await fetch(`/api/timeblocks?id=${editingBlockId}`, {
+          method: 'DELETE',
+        });
+        setTimeBlocks(prev => prev.filter(b => b.id !== editingBlockId));
+        cancelEdit();
+      } catch (err) {
+        console.error('Error deleting time block:', err);
+      }
+    }
+  };
+
+  const deleteSticker = async (id: string) => {
+    try {
+      pushToUndo(events, timeBlocks, strokes, stickers);
+      await fetch(`/api/stickers?id=${id}`, {
+        method: 'DELETE',
+      });
+      setStickers(prev => prev.filter(s => s.id !== id));
+    } catch (err) {
+      console.error('Error deleting sticker:', err);
     }
   };
 
@@ -998,13 +1594,89 @@ export default function Home() {
     }
   };
 
+  // Virtualization bounds calculation
+  const visibleBounds = useMemo(() => {
+    // We add a buffer area (e.g. 1000px) so items just off-screen are rendered,
+    // ensuring smooth scrolling and panning without sudden pop-ins.
+    const bufferX = windowSize.width || 1000;
+    const bufferY = windowSize.height || 800;
+    return {
+      minX: -offset.x - bufferX,
+      maxX: -offset.x + windowSize.width + bufferX,
+      minY: -offset.y - bufferY,
+      maxY: -offset.y + windowSize.height + bufferY,
+    };
+  }, [offset.x, offset.y, windowSize.width, windowSize.height]);
+
+  const visibleEvents = useMemo(() => {
+    return events.filter(ev => {
+      if (ev.id === editingEventId) return true; // Always render the event being edited
+      const x = dateToOffset(ev.time) * pixelsPerYear;
+      const y = ev.y;
+      return x >= visibleBounds.minX && x <= visibleBounds.maxX &&
+             y >= visibleBounds.minY && y <= visibleBounds.maxY;
+    });
+  }, [events, visibleBounds, pixelsPerYear, editingEventId]);
+
+  const visibleTimeBlocks = useMemo(() => {
+    return timeBlocks.filter(block => {
+      if (block.id === editingBlockId) return true; // Always render the block being edited
+      const startX = dateToOffset(block.startTime) * pixelsPerYear;
+      const endX = dateToOffset(block.endTime) * pixelsPerYear;
+      const y = block.y * 60;
+      return endX >= visibleBounds.minX && startX <= visibleBounds.maxX &&
+             y >= visibleBounds.minY && y <= visibleBounds.maxY;
+    });
+  }, [timeBlocks, visibleBounds, pixelsPerYear, editingBlockId]);
+
+  const visibleStrokes = useMemo(() => {
+    return strokes.filter(stroke => {
+      if (stroke.points.length === 0) return false;
+      // Quick bounds check for stroke
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (let i = 0; i < stroke.points.length; i += Math.max(1, Math.floor(stroke.points.length / 20))) { // sample up to 20 points for speed
+        const p = stroke.points[i];
+        const px = p.x * pixelsPerYear;
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (p.y < minY) minY = p.y;
+        if (p.y > maxY) maxY = p.y;
+      }
+      return maxX >= visibleBounds.minX && minX <= visibleBounds.maxX &&
+             maxY >= visibleBounds.minY && minY <= visibleBounds.maxY;
+    });
+  }, [strokes, visibleBounds, pixelsPerYear]);
+
+  const visibleStickers = useMemo(() => {
+    return stickers.filter(sticker => {
+      const x = dateToOffset(sticker.time) * pixelsPerYear;
+      const y = sticker.y;
+      return x >= visibleBounds.minX && x <= visibleBounds.maxX &&
+             y >= visibleBounds.minY && y <= visibleBounds.maxY;
+    });
+  }, [stickers, visibleBounds, pixelsPerYear]);
+
   if (!hydrated) {
     return (
-      <main className="relative min-h-screen w-full overflow-hidden bg-[#fdf2f8] font-sans text-slate-800">
-        <div className="fixed inset-0 pointer-events-none z-0">
-          <div className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] bg-pink-200/20 blur-[120px] rounded-full" />
-          <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] bg-blue-200/20 blur-[120px] rounded-full" />
-        </div>
+      <main className="relative min-h-screen w-full overflow-hidden bg-[#F7F4EB] font-sans text-slate-800 touch-none" style={{ cursor: 'crosshair' }}>
+        <div className="fixed inset-0 z-0 pointer-events-none bg-[#F7F4EB]" style={{
+          backgroundImage: `
+            linear-gradient(to right, rgba(160, 140, 100, 0.15) 1px, transparent 1px), 
+            linear-gradient(to bottom, rgba(160, 140, 100, 0.15) 1px, transparent 1px),
+            linear-gradient(to right, rgba(160, 140, 100, 0.05) 1px, transparent 1px), 
+            linear-gradient(to bottom, rgba(160, 140, 100, 0.05) 1px, transparent 1px),
+            url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)' opacity='0.08'/%3E%3C/svg%3E")
+          `,
+          backgroundSize: `
+            60px 60px,
+            60px 60px,
+            15px 15px,
+            15px 15px,
+            200px 200px
+          `,
+          backgroundPosition: `0px 0px`,
+          boxShadow: 'inset 0 0 100px rgba(160, 140, 100, 0.1)',
+        }} />
       </main>
     );
   }
@@ -1012,7 +1684,7 @@ export default function Home() {
   return (
     <main 
       ref={containerRef}
-      className="relative min-h-screen w-full overflow-hidden bg-[#fdf2f8] font-sans text-slate-800 touch-none"
+      className="relative min-h-screen w-full overflow-hidden bg-[#F7F4EB] font-sans text-slate-800 touch-none"
       onWheel={handleWheel}
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
@@ -1021,11 +1693,6 @@ export default function Home() {
       onClick={handleCanvasClick}
       style={{ cursor: isPanning ? 'grabbing' : 'crosshair' }}
     >
-      <div className="fixed inset-0 pointer-events-none z-0">
-        <div className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] bg-pink-200/20 blur-[120px] rounded-full" />
-        <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] bg-blue-200/20 blur-[120px] rounded-full" />
-      </div>
-
       {hydrated && windowSize.width > 0 && (
         <div className="fixed top-0 bottom-0 w-[2px] bg-red-500/40 z-20 pointer-events-none shadow-[0_0_15px_rgba(239,68,68,0.4)]" style={{ left: offset.x + dateToOffset(todayIso) * pixelsPerYear }}>
           <div className="absolute top-36 -left-12 w-24 text-center">
@@ -1050,7 +1717,7 @@ export default function Home() {
           15px 15px,
           200px 200px
         `,
-        backgroundPosition: `${offset.x % 60}px ${offset.y % 60}px`,
+        backgroundPosition: `0px 0px`,
         boxShadow: 'inset 0 0 100px rgba(160, 140, 100, 0.1)', // 添加边缘暗角，增加纸张做旧感
       }} />
       
@@ -1071,9 +1738,26 @@ export default function Home() {
             <motion.path d={`M ${0 * pixelsPerYear},1200 C 2 * pixelsPerYear,1200 ${5 * pixelsPerYear},1300 ${8 * pixelsPerYear},1380 S ${11 * pixelsPerYear},1500 ${14 * pixelsPerYear},1500`} stroke="url(#grad-teal)" strokeWidth="32" fill="none" strokeLinecap="round" /> */}
 
             <g className="pointer-events-auto">
+              {/* Stickers */}
+              <g className="stickers">
+                {visibleStickers.map(sticker => (
+                  <text
+                    key={sticker.id}
+                    x={dateToOffset(sticker.time) * pixelsPerYear}
+                    y={sticker.y}
+                    fontSize="32"
+                    textAnchor="middle"
+                    dominantBaseline="central"
+                    style={{ cursor: activeTool === 'eraser' ? 'crosshair' : 'default', userSelect: 'none' }}
+                  >
+                    {sticker.emoji}
+                  </text>
+                ))}
+              </g>
+
               {/* Strokes */}
               <g className="strokes">
-                {strokes.map(stroke => {
+                {visibleStrokes.map(stroke => {
                   if (stroke.points.length === 0) return null;
                   const d = stroke.points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x * pixelsPerYear} ${p.y}`).join(' ');
                   return <path key={stroke.id} d={d} fill="none" stroke={stroke.color} strokeWidth={stroke.width} strokeLinecap="round" strokeLinejoin="round" />;
@@ -1105,18 +1789,27 @@ export default function Home() {
 
               <AnimatePresence>
                 {/* 渲染已有的 TimeBlocks */}
-                {timeBlocks.map(block => {
+                {visibleTimeBlocks.map(block => {
                   const x = dateToOffset(block.startTime) * pixelsPerYear;
                   const y = block.y * 60 + 10;
                   const width = (dateToOffset(block.endTime) - dateToOffset(block.startTime)) * pixelsPerYear;
                   return (
                     <g
                       key={block.id}
+                      className="draggable-element"
                       onClick={(e) => {
                         e.stopPropagation();
+                        if (activeTool === 'draw' || activeTool === 'eraser') return;
+                        if (activeTool === 'select') return;
                         openTimeBlockEditor(block);
                       }}
-                      style={{ cursor: 'pointer' }}
+                      onMouseDown={(e) => {
+                        if (activeTool === 'select') {
+                          e.stopPropagation();
+                          scheduleDragStart('block', block.id, e);
+                        }
+                      }}
+                      style={{ cursor: activeTool === 'select' ? 'grab' : 'pointer' }}
                     >
                       <motion.rect
                         x={x}
@@ -1162,10 +1855,11 @@ export default function Home() {
                         style={{ cursor: 'ew-resize' }}
                         onMouseDown={(e) => {
                           e.stopPropagation();
-                          setResizingBlock({ id: block.id, edge: 'left', y: block.y });
+                          if (activeTool === 'draw' || activeTool === 'eraser') return;
                           if (editingBlockId !== block.id) {
                             openTimeBlockEditor(block);
                           }
+                          setResizingBlock({ id: block.id, edge: 'left', y: block.y });
                         }}
                       />
                       {/* Right Drag Handle */}
@@ -1178,10 +1872,11 @@ export default function Home() {
                         style={{ cursor: 'ew-resize' }}
                         onMouseDown={(e) => {
                           e.stopPropagation();
-                          setResizingBlock({ id: block.id, edge: 'right', y: block.y });
+                          if (activeTool === 'draw' || activeTool === 'eraser') return;
                           if (editingBlockId !== block.id) {
                             openTimeBlockEditor(block);
                           }
+                          setResizingBlock({ id: block.id, edge: 'right', y: block.y });
                         }}
                       />
                     </g>
@@ -1244,14 +1939,24 @@ export default function Home() {
               </AnimatePresence>
 
               <AnimatePresence>
-                {events.map(event => (
+                {visibleEvents.map(event => (
                   <Marker
                     key={event.id}
                     x={dateToOffset(event.time) * pixelsPerYear}
                     y={event.y}
                     color={event.color}
                     label={event.label}
-                    onClick={() => startEditing(event)}
+                    onClick={() => {
+                      if (activeTool === 'draw' || activeTool === 'eraser') return;
+                      if (activeTool === 'select') return;
+                      startEditing(event);
+                    }}
+                    onMouseDown={(e) => {
+                      if (activeTool === 'select') {
+                        e.stopPropagation();
+                        scheduleDragStart('event', event.id, e);
+                      }
+                    }}
                     isEditing={editingEventId === event.id}
                     isHighlighted={highlightedEventId === event.id}
                   />
@@ -1269,17 +1974,51 @@ export default function Home() {
                       y={(pendingEvent?.y ?? (pendingBlock ? pendingBlock.y * 60 + 10 : 400)) + 25} 
                       width="280" 
                       height="320"
+                      style={{ overflow: 'visible' }}
                     >
                       <div className="flex flex-col items-center p-1 editing-popup" onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} onMouseUp={e => e.stopPropagation()}>
-                        <div className="glass px-4 py-4 rounded-3xl border border-white/60 shadow-2xl flex flex-col gap-4 w-full">
+                        <div className="glass px-4 py-4 rounded-[20px] border border-white/60 shadow-xl flex flex-col gap-4 w-full bg-white/70 backdrop-blur-xl">
                           <div className="flex items-center justify-between">
-                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                            <span className="text-[12px] font-bold text-slate-400 tracking-wider">
                               {editingBlockId || (pendingBlock && activeTool === 'block') ? "时间方块" : "点事件"}
                             </span>
-                            <div className="flex gap-1">
-                              {["#fbbf24", "#c084fc", "#2dd4bf", "#ef4444", "#3b82f6"].map(c => (
-                                <button key={c} onClick={() => setCurrentColor(c)} className={`w-3.5 h-3.5 rounded-full transition-transform hover:scale-110 ${currentColor === c ? 'ring-2 ring-offset-1 ring-slate-400 scale-110' : ''}`} style={{ backgroundColor: c }} />
+                            <div className="flex items-center gap-1.5 relative">
+                              {/* 常用颜色 */}
+                              {recentColors.map(c => (
+                                <button 
+                                  key={c} 
+                                  onClick={() => {
+                                    handleColorChange(c);
+                                    updateRecentColors(c);
+                                    if (editingBlockId || (pendingBlock && activeTool === 'block')) {
+                                      saveTimeBlock(currentTime, currentEndTime, currentLabel, c, currentCategory);
+                                    } else {
+                                      saveEvent(currentTime, currentLabel, c, currentCategory);
+                                    }
+                                  }} 
+                                  className={`w-4 h-4 rounded-full transition-transform hover:scale-110 ${currentColor === c ? 'ring-2 ring-offset-2 ring-slate-300 scale-110' : ''}`} 
+                                  style={{ backgroundColor: c }} 
+                                />
                               ))}
+                              {/* 更多颜色（调色盘） */}
+                              <div className="relative ml-1 w-5 h-5 rounded-full border border-slate-300 flex items-center justify-center bg-white shadow-sm hover:bg-slate-50 transition-colors overflow-hidden cursor-pointer pointer-events-auto">
+                                <div className="absolute inset-0 w-full h-full bg-gradient-to-br from-red-400 via-green-400 to-blue-400 opacity-80 pointer-events-none" />
+                                <input 
+                                  type="color" 
+                                  value={currentColor} 
+                                  onClick={e => e.stopPropagation()}
+                                  onChange={e => {
+                                    handleColorChange(e.target.value);
+                                    if (editingBlockId || (pendingBlock && activeTool === 'block')) {
+                                      saveTimeBlock(currentTime, currentEndTime, currentLabel, e.target.value, currentCategory);
+                                    } else {
+                                      saveEvent(currentTime, currentLabel, e.target.value, currentCategory);
+                                    }
+                                  }}
+                                  onBlur={() => updateRecentColors(currentColor)}
+                                  className="absolute inset-[-10px] w-[200%] h-[200%] opacity-0 cursor-pointer pointer-events-auto"
+                                />
+                              </div>
                             </div>
                           </div>
 
@@ -1288,54 +2027,116 @@ export default function Home() {
                               autoFocus 
                               type="text" 
                               value={currentLabel} 
-                              onChange={e => setCurrentLabel(e.target.value)} 
-                              onKeyDown={e => e.key === 'Enter' && saveEvent()}
+                              onChange={e => {
+                                setCurrentLabel(e.target.value);
+                                saveEvent(currentTime, e.target.value, currentColor, currentCategory);
+                              }} 
+                              onKeyDown={e => e.key === 'Enter' && cancelEdit()}
                               placeholder="输入标题..." 
                               className="bg-transparent border-none outline-none text-lg font-bold text-slate-700 w-full placeholder:text-slate-300" 
                             />
                           )}
 
-                          <div className="flex flex-col gap-2">
-                            <div className="flex items-center gap-2 bg-white/30 rounded-xl px-3 py-2 border border-white/40">
-                              <Calendar className="w-3.5 h-3.5 text-slate-500" />
-                              <input type="date" value={currentTime} onChange={e => setCurrentTime(e.target.value)} className="bg-transparent border-none outline-none text-[11px] font-medium text-slate-700 w-full" />
+                          <div className="flex flex-col gap-2.5">
+                            <div className="flex items-center justify-between bg-white/60 rounded-xl px-3 py-2.5 border border-white/80 shadow-sm transition-colors focus-within:border-blue-200 focus-within:bg-white">
+                              <Calendar className="w-4 h-4 text-slate-400" />
+                              <input 
+                                type="date" 
+                                value={currentTime} 
+                                onChange={e => {
+                                  setCurrentTime(e.target.value);
+                                  if (editingBlockId || (pendingBlock && activeTool === 'block')) {
+                                    saveTimeBlock(e.target.value, currentEndTime, currentLabel, currentColor, currentCategory);
+                                  } else {
+                                    saveEvent(e.target.value, currentLabel, currentColor, currentCategory);
+                                  }
+                                }} 
+                                onKeyDown={e => e.key === 'Enter' && cancelEdit()}
+                                className="bg-transparent border-none outline-none text-[13px] font-semibold text-slate-600 text-center w-full flex-1 mx-2" 
+                              />
+                              <Calendar className="w-4 h-4 text-slate-400 opacity-0" />
                             </div>
                             
                             {(editingBlockId || (pendingBlock && activeTool === 'block')) && (
-                              <div className="flex items-center gap-2 bg-white/30 rounded-xl px-3 py-2 border border-white/40 animate-in fade-in slide-in-from-top-1">
-                                <Calendar className="w-3.5 h-3.5 text-slate-500" />
-                                <input type="date" value={currentEndTime} onChange={e => setCurrentTimeEnd(e.target.value)} className="bg-transparent border-none outline-none text-[11px] font-medium text-slate-700 w-full" />
+                              <div className="flex items-center justify-between bg-white/60 rounded-xl px-3 py-2.5 border border-white/80 shadow-sm transition-colors focus-within:border-blue-200 focus-within:bg-white animate-in fade-in slide-in-from-top-1">
+                                <Calendar className="w-4 h-4 text-slate-400" />
+                                <input 
+                                  type="date" 
+                                  value={currentEndTime} 
+                                  onChange={e => {
+                                    setCurrentTimeEnd(e.target.value);
+                                    saveTimeBlock(currentTime, e.target.value, currentLabel, currentColor, currentCategory);
+                                  }} 
+                                  onKeyDown={e => e.key === 'Enter' && cancelEdit()}
+                                  className="bg-transparent border-none outline-none text-[13px] font-semibold text-slate-600 text-center w-full flex-1 mx-2" 
+                                />
+                                <Calendar className="w-4 h-4 text-slate-400 opacity-0" />
                               </div>
                             )}
                           </div>
 
-                          <div className="flex flex-wrap gap-1.5 py-1">
-                            {["运动", "职业", "旅行", "健康", "学习", "财务", "社交"].map(cat => (
+                          {/* 标签栏（单行） */}
+                          <div className="flex items-center gap-2 mt-1">
+                            <div className="flex-1 flex items-center bg-white/60 rounded-xl px-3 py-2 border border-white/80 shadow-sm focus-within:border-blue-200 focus-within:bg-white transition-colors">
+                              <input 
+                                type="text"
+                                placeholder="输入新标签..."
+                                value={currentCategory === '其他' ? '' : currentCategory}
+                                onChange={e => {
+                                  const newCat = e.target.value || '其他';
+                                  setCurrentCategory(newCat);
+                                  if (editingBlockId || (pendingBlock && activeTool === 'block')) {
+                                    saveTimeBlock(currentTime, currentEndTime, currentLabel, currentColor, newCat);
+                                  } else {
+                                    saveEvent(currentTime, currentLabel, currentColor, newCat);
+                                  }
+                                }}
+                                onKeyDown={e => e.key === 'Enter' && cancelEdit()}
+                                className="bg-transparent border-none outline-none text-xs font-medium text-slate-600 w-full placeholder:text-slate-400"
+                              />
+                            </div>
+                            
+                            <div className="relative">
                               <button 
-                                key={cat} 
-                                onClick={() => setCurrentCategory(cat)}
-                                className={`px-2.5 py-1 rounded-lg text-[10px] transition-all ${currentCategory === cat ? 'bg-slate-800 text-white shadow-md' : 'bg-white/40 text-slate-500 hover:bg-white/60'}`}
+                                onClick={() => setShowCategoryDropdown(!showCategoryDropdown)}
+                                className="flex items-center justify-center bg-white/60 rounded-xl px-3 py-2 border border-white/80 shadow-sm hover:bg-white transition-colors h-[34px]"
                               >
-                                {cat}
+                                <span className="text-xs font-medium text-slate-500 mr-1">已有</span>
+                                <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
                               </button>
-                            ))}
+                              
+                              {showCategoryDropdown && (
+                                <div className="absolute top-full right-0 mt-2 w-32 bg-white rounded-xl shadow-xl border border-slate-100 z-50 overflow-hidden flex flex-col">
+                                  {["运动", "职业", "旅行", "健康", "学习", "财务", "社交"].map(cat => (
+                                    <button 
+                                      key={cat} 
+                                      onClick={() => { 
+                                        setCurrentCategory(cat); 
+                                        setShowCategoryDropdown(false); 
+                                        if (editingBlockId || (pendingBlock && activeTool === 'block')) {
+                                          saveTimeBlock(currentTime, currentEndTime, currentLabel, currentColor, cat);
+                                        } else {
+                                          saveEvent(currentTime, currentLabel, currentColor, cat);
+                                        }
+                                      }}
+                                      className={`px-3 py-2 text-xs text-left hover:bg-slate-50 transition-colors ${currentCategory === cat ? 'bg-blue-50 text-blue-600 font-semibold' : 'text-slate-600'}`}
+                                    >
+                                      {cat}
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
                           </div>
 
-                          <div className="flex items-center gap-2 pt-2 border-t border-slate-100">
-                            <button 
-                              onClick={editingBlockId || (pendingBlock && activeTool === 'block') ? saveTimeBlock : saveEvent} 
-                              className="flex-1 bg-slate-800 text-white py-2.5 rounded-xl text-xs font-bold hover:bg-slate-700 transition-all flex items-center justify-center gap-2 shadow-lg shadow-slate-200"
-                            >
-                              <Check className="w-4 h-4 text-blue-300" /> 
-                              {(editingEventId || editingBlockId) ? "保存修改" : "完成创建"}
-                            </button>
+                          <div className="flex items-center gap-2 pt-3">
                             {(editingEventId || editingBlockId) && (
-                              <button onClick={editingBlockId ? deleteTimeBlock : deleteEvent} className="p-2.5 hover:bg-red-50 rounded-xl text-red-500 transition-colors" title="删除">
+                              <button onClick={editingBlockId ? deleteTimeBlock : deleteEvent} className="p-3 hover:bg-red-50 bg-white border border-red-100 rounded-[14px] text-red-500 transition-colors shadow-sm" title="删除">
                                 <Trash2 className="w-4 h-4" />
                               </button>
                             )}
-                            <button onClick={cancelEdit} className="p-2.5 hover:bg-slate-50 rounded-xl text-slate-400 transition-colors" title="取消">
-                              <X className="w-4 h-4" />
+                            <button onClick={cancelEdit} className="flex-1 p-3 hover:bg-slate-100 bg-white border border-slate-200 rounded-[14px] text-slate-500 font-medium transition-colors shadow-sm" title="关闭">
+                              关闭
                             </button>
                           </div>
                         </div>
@@ -1350,35 +2151,106 @@ export default function Home() {
       </div>
 
       <div className="fixed inset-0 pointer-events-none z-50 overflow-hidden">
-        <div className="absolute top-10 left-10 pointer-events-auto" onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} onMouseUp={e => e.stopPropagation()}>
+        <div className="absolute top-10 left-10 pointer-events-auto" onClick={e => e.stopPropagation()}>
           <h1 className="text-3xl font-light tracking-wider text-slate-900/80 leading-tight">
             <span className="sr-only">时间集合体</span>
             Time Complex
           </h1>
         </div>
 
-        {/* Top Dynamic Multi-level Timeline */}
-        <div className="absolute top-4 left-0 right-0 h-20 pointer-events-none">
-          <div className="relative w-full h-full">
-            {dynamicTimelineTicks.map((tick: TimelineTick, i: number) => {
-              const x = tick.x;
+        {/* Draggable Glass Ruler */}
+        <div
+          className="absolute left-0 right-0 h-[84px] pointer-events-auto ui-interactive px-5"
+          style={{ top: rulerY }}
+          onMouseDown={(e) => {
+            if (!(e.target instanceof Element)) return;
+            if (e.target.closest('.ruler-drag-handle')) {
+              const currentTop = rulerY;
+              rulerDragOffsetRef.current = e.clientY - currentTop;
+              isDraggingRulerRef.current = true;
+              e.stopPropagation();
+              e.preventDefault();
+            }
+          }}
+        >
+          <div
+            className="relative w-full h-full overflow-hidden rounded-[24px]"
+            style={{
+              backgroundColor: `rgba(255,255,255,${rulerMaterial.baseAlpha})`,
+              border: `1px solid rgba(255,255,255,${rulerMaterial.borderAlpha})`,
+              backdropFilter: `blur(${rulerMaterial.blurPx}px) saturate(110%) contrast(105%)`,
+              WebkitBackdropFilter: `blur(${rulerMaterial.blurPx}px) saturate(110%) contrast(105%)`,
+              boxShadow: `0 10px 22px rgba(15,23,42,${rulerMaterial.shadowAlpha}), inset 0 1px 0 rgba(255,255,255,0.22)`,
+            }}
+          >
+            <div
+              className="absolute inset-0 pointer-events-none"
+              style={{
+                backgroundImage: `linear-gradient(to bottom, rgba(255,255,255,${rulerMaterial.gradientTopAlpha}), rgba(255,255,255,0), rgba(255,255,255,${rulerMaterial.gradientBottomAlpha}))`,
+              }}
+            />
+            <div
+              className="absolute inset-0 pointer-events-none"
+              style={{
+                backgroundImage: `radial-gradient(circle at 18% 18%, rgba(255,255,255,${rulerMaterial.highlightAlpha}), transparent 40%), radial-gradient(circle at 80% 72%, rgba(148,163,184,${rulerMaterial.tintAlpha}), transparent 35%)`,
+              }}
+            />
+            <div className="absolute inset-x-0 top-0 h-[1px] pointer-events-none" style={{ backgroundColor: `rgba(255,255,255,${rulerMaterial.topLineAlpha})` }} />
+            <div className="absolute left-0 right-0 top-[28px] h-[1px] bg-slate-500/16 pointer-events-none" />
+            <div className="absolute left-0 right-0 top-[52px] h-[1px] bg-slate-500/12 pointer-events-none" />
 
-              return (
-                <div key={`${tick.type}-${tick.value}-${i}`} className="absolute flex flex-col items-center" style={{ left: x, transform: 'translateX(-50%)' }}>
-                  {tick.type === 'year' ? (
-                    <>
-                      <span className="text-[12px] font-black text-slate-700/80 mb-1">{tick.value}</span>
-                      <div className={`w-3 h-3 rotate-45 border-2 ${hydrated && tick.value === todayYear ? 'border-red-500 bg-red-100 shadow-[0_0_10px_rgba(239,68,68,0.5)] scale-125' : (typeof tick.value === 'number' && tick.value % 2 === 0 ? 'border-blue-400/60 bg-blue-50/50' : 'border-slate-300/60 bg-slate-50/50')}`} />
-                    </>
-                  ) : (
-                    <>
-                      <span className="text-[9px] font-bold text-slate-500/60 mb-0.5">{tick.value}</span>
-                      <div className={`rounded-full bg-slate-300/40 ${tick.type === 'quarter' ? 'w-1.5 h-1.5' : 'w-1 h-1'}`} />
-                    </>
-                  )}
-                </div>
-              );
-            })}
+            <div className="absolute top-2 left-1/2 -translate-x-1/2 pointer-events-auto">
+              <div
+                className="ruler-drag-handle flex items-center gap-2 rounded-full border border-white/60 bg-white/40 px-3 py-1 text-[10px] font-semibold tracking-wide text-slate-600 shadow-sm select-none"
+                style={{ cursor: HAND_CURSOR }}
+              >
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-slate-400/70" />
+                拖拽尺子
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-slate-400/70" />
+              </div>
+            </div>
+
+            <div className="relative w-full h-full pointer-events-none">
+              {dynamicTimelineTicks.map((tick: TimelineTick, i: number) => {
+                const x = tick.x;
+                const lineWidth = tick.type === 'year' ? 1 : tick.type === 'year_minor' ? 0.9 : tick.type === 'quarter' ? 0.8 : tick.type === 'quarter_minor' ? 0.75 : 0.7;
+                const edgeSegmentHeight = tick.type === 'year' ? 33 : tick.type === 'year_minor' ? 10 : tick.type === 'quarter' ? 24 : tick.type === 'quarter_minor' ? 14 : 18;
+                const lineAlpha = tick.type === 'year'
+                  ? (hydrated && tick.value === todayYear ? 0.8 : 0.45)
+                  : tick.type === 'year_minor' ? 0.22 : tick.type === 'quarter' ? 0.26 : tick.type === 'quarter_minor' ? 0.2 : 0.2;
+                const lineColor = hydrated && tick.value === todayYear && tick.type === 'year'
+                  ? `rgba(239,68,68,${lineAlpha})`
+                  : `rgba(71,85,105,${lineAlpha})`;
+                return (
+                  <div key={`${tick.type}-${tick.value}-${i}`} className="absolute h-[84px]" style={{ left: x, top: 0, transform: 'translateX(-50%)' }}>
+                    <div
+                      className="absolute top-0 left-1/2 -translate-x-1/2"
+                      style={{ width: lineWidth, height: edgeSegmentHeight, backgroundColor: lineColor }}
+                    />
+                    <div
+                      className="absolute bottom-0 left-1/2 -translate-x-1/2"
+                      style={{ width: lineWidth, height: edgeSegmentHeight, backgroundColor: lineColor }}
+                    />
+                    {tick.type === 'year' && (
+                      <span
+                        className={`absolute left-1/2 -translate-x-1/2 text-[12px] font-black ${hydrated && tick.value === todayYear ? 'text-red-600/90' : 'text-slate-700/85'}`}
+                        style={{ top: 42, transform: 'translate(-50%, -50%)' }}
+                      >
+                        {tick.value}
+                      </span>
+                    )}
+                    {(tick.type === 'month' || tick.type === 'quarter') && (
+                      <span
+                        className={`absolute left-1/2 -translate-x-1/2 font-bold ${tick.type === 'quarter' ? 'text-[9px] text-slate-600/70' : 'text-[8px] text-slate-500/65'}`}
+                        style={{ top: 42, transform: 'translate(-50%, -50%)' }}
+                      >
+                        {tick.value}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           </div>
         </div>
 
@@ -1393,7 +2265,7 @@ export default function Home() {
           ))}
         </aside> */}
 
-        <div className="absolute right-12 top-10 flex items-center gap-4 pointer-events-auto" onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} onMouseUp={e => e.stopPropagation()}>
+        <div className="absolute right-12 top-10 flex items-center gap-4 pointer-events-auto ui-interactive" onClick={e => e.stopPropagation()}>
            {isLoggedIn ? (
              <div className="flex items-center gap-4">
                <div className="flex items-center gap-2 px-4 py-2 rounded-full glass border border-white/60 text-slate-700 text-sm font-medium">
@@ -1411,29 +2283,25 @@ export default function Home() {
              </div>
            ) : (
              <>
-               <motion.button 
-                 whileHover={{ scale: 1.05, backgroundColor: "rgba(255, 255, 255, 0.9)" }}
-                 whileTap={{ scale: 0.95 }}
+              <button
                  onClick={() => { setAuthMode('login'); setUsername(""); setPassword(""); setLoginError(""); setShowPassword(false); }}
                  className="flex items-center gap-2 px-5 py-2.5 rounded-full glass border border-white/60 text-slate-700 text-sm font-medium shadow-sm transition-all"
                >
                  <LogIn className="w-4 h-4 opacity-60" />
                  登录
-               </motion.button>
-               <motion.button 
-                 whileHover={{ scale: 1.05, backgroundColor: "rgba(30, 41, 59, 0.9)" }}
-                 whileTap={{ scale: 0.95 }}
+              </button>
+              <button
                  onClick={() => { setAuthMode('register'); setUsername(""); setPassword(""); setEmail(""); setConfirmPassword(""); setLoginError(""); setShowPassword(false); setShowConfirmPassword(false); }}
                  className="flex items-center gap-2 px-5 py-2.5 rounded-full bg-slate-800 text-white text-sm font-medium shadow-md shadow-slate-200/50 transition-all"
                >
                  <UserPlus className="w-4 h-4 opacity-80" />
                  注册
-               </motion.button>
+              </button>
              </>
            )}
          </div>
 
-        <div className="fixed bottom-10 left-1/2 -translate-x-1/2 z-[100] pointer-events-auto" onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} onMouseUp={e => e.stopPropagation()}>
+        <div className="fixed bottom-10 left-1/2 -translate-x-1/2 z-[100] pointer-events-auto ui-interactive" onClick={e => e.stopPropagation()}>
           <div suppressHydrationWarning className="glass px-3 py-3 rounded-3xl border border-white/60 shadow-2xl flex items-center gap-2">
             {/* 0. 选中模式 */}
             <motion.button 
@@ -1469,15 +2337,38 @@ export default function Home() {
             </motion.button>
 
             {/* 3. 标签贴纸 */}
-            <motion.button 
-              whileHover={{ scale: 1.05, y: -2 }}
-              whileTap={{ scale: 0.95 }}
-              onClick={() => switchTool('sticker')}
-              className={`group relative p-3.5 rounded-2xl transition-all flex items-center justify-center ${activeTool === 'sticker' ? 'bg-slate-800 text-white shadow-lg' : 'text-slate-500 hover:bg-white/50'}`}
-            >
-              <StickyNote className="w-6 h-6" />
-              <span className="absolute -top-10 left-1/2 -translate-x-1/2 px-2 py-1 bg-slate-800 text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none shadow-xl">标签贴纸</span>
-            </motion.button>
+            <div className="relative group/sticker">
+              <motion.button 
+                whileHover={{ scale: 1.05, y: -2 }}
+                whileTap={{ scale: 0.95 }}
+                onClick={() => { switchTool('sticker'); setShowStickerMenu(!showStickerMenu); }}
+                className={`group relative p-3.5 rounded-2xl transition-all flex items-center justify-center ${activeTool === 'sticker' ? 'bg-slate-800 text-white shadow-lg' : 'text-slate-500 hover:bg-white/50'}`}
+              >
+                <StickyNote className="w-6 h-6" />
+                <span className="absolute -top-10 left-1/2 -translate-x-1/2 px-2 py-1 bg-slate-800 text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none shadow-xl z-50">标签贴纸</span>
+              </motion.button>
+              
+              <AnimatePresence>
+                {activeTool === 'sticker' && showStickerMenu && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                    className="absolute bottom-full mb-4 left-1/2 -translate-x-1/2 glass p-3 rounded-2xl flex flex-wrap gap-2 w-[220px] z-50 pointer-events-auto shadow-2xl"
+                  >
+                    {STICKERS_LIST.map(emoji => (
+                      <button 
+                        key={emoji} 
+                        onClick={() => { setCurrentSticker(emoji); setShowStickerMenu(false); }} 
+                        className={`text-2xl hover:scale-125 transition-transform p-1 rounded-xl ${currentSticker === emoji ? 'bg-white/50 ring-2 ring-slate-400' : 'hover:bg-white/30'}`}
+                      >
+                        {emoji}
+                      </button>
+                    ))}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
 
             {/* 4. 导入素材 */}
             <motion.button 
@@ -1619,7 +2510,7 @@ export default function Home() {
             </AnimatePresence>
           </div>
 
-        <div className="absolute bottom-12 right-10 bg-white/60 backdrop-blur-xl px-5 py-2.5 rounded-full text-xs text-slate-500 border border-white/80 shadow-sm select-none pointer-events-auto"><span className="font-bold text-blue-600 mr-2">Level {currentZoom.level}</span><span className="font-medium text-slate-800">滚轮</span> 切换层级 • <span className="font-medium text-slate-800 ml-2">拖拽</span> 平移 • <span className="ml-2 font-mono">View: {currentZoom.yearsVisible}Y</span></div>
+        <div className="absolute bottom-12 right-10 bg-white/60 backdrop-blur-xl px-5 py-2.5 rounded-full text-xs text-slate-500 border border-white/80 shadow-sm select-none pointer-events-auto ui-interactive"><span className="font-bold text-blue-600 mr-2">Level {currentZoom.level}</span><span className="font-medium text-slate-800">滚轮</span> 切换层级 • <span className="font-medium text-slate-800 ml-2">拖拽</span> 平移 • <span className="ml-2 font-mono">View: {currentZoom.yearsVisible}Y</span></div>
 
         {/* Auth Modal */}
         <AnimatePresence>
@@ -1636,7 +2527,9 @@ export default function Home() {
                 initial={{ opacity: 0, scale: 0.9, y: 20 }}
                 animate={{ opacity: 1, scale: 1, y: 0 }}
                 exit={{ opacity: 0, scale: 0.9, y: 20 }}
-                className="relative glass-pill bg-white/80 backdrop-blur-2xl p-8 rounded-[2rem] border border-white shadow-2xl w-full max-w-sm pointer-events-auto"
+                className="relative glass-pill bg-white/80 backdrop-blur-2xl p-8 rounded-[2rem] border border-white shadow-2xl w-full max-w-sm pointer-events-auto ui-interactive"
+                onMouseDownCapture={e => e.stopPropagation()}
+                onMouseUpCapture={e => e.stopPropagation()}
                 onClick={e => e.stopPropagation()}
               >
                 <div className="flex flex-col items-center text-center mb-8">
@@ -1662,10 +2555,20 @@ export default function Home() {
                     <div className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-slate-50/50 border border-slate-200/50 focus-within:border-slate-400 transition-all">
                       <User className="w-4 h-4 text-slate-400" />
                       <input 
+                        ref={usernameRef}
                         type="text" 
                         value={username}
                         onChange={e => setUsername(e.target.value)}
-                        onKeyDown={e => e.key === 'Enter' && handleLogin()}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            if (authMode === 'register') {
+                              emailRef.current?.focus();
+                            } else {
+                              passwordRef.current?.focus();
+                            }
+                          }
+                        }}
                         placeholder="请输入用户名" 
                         className="bg-transparent border-none outline-none text-sm text-slate-700 w-full" 
                       />
@@ -1678,10 +2581,16 @@ export default function Home() {
                       <div className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-slate-50/50 border border-slate-200/50 focus-within:border-slate-400 transition-all">
                         <Mail className="w-4 h-4 text-slate-400" />
                         <input 
+                          ref={emailRef}
                           type="email" 
                           value={email}
                           onChange={e => setEmail(e.target.value)}
-                          onKeyDown={e => e.key === 'Enter' && handleLogin()}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              passwordRef.current?.focus();
+                            }
+                          }}
                           placeholder="请输入邮箱" 
                           className="bg-transparent border-none outline-none text-sm text-slate-700 w-full" 
                         />
@@ -1694,10 +2603,20 @@ export default function Home() {
                     <div className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-slate-50/50 border border-slate-200/50 focus-within:border-slate-400 transition-all">
                       <Lock className="w-4 h-4 text-slate-400" />
                       <input 
+                        ref={passwordRef}
                         type={showPassword ? "text" : "password"} 
                         value={password}
                         onChange={e => setPassword(e.target.value)}
-                        onKeyDown={e => e.key === 'Enter' && handleLogin()}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            if (authMode === 'register') {
+                              confirmPasswordRef.current?.focus();
+                            } else {
+                              handleLogin();
+                            }
+                          }
+                        }}
                         placeholder="请输入密码" 
                         className="bg-transparent border-none outline-none text-sm text-slate-700 w-full" 
                       />
@@ -1713,10 +2632,16 @@ export default function Home() {
                       <div className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-slate-50/50 border border-slate-200/50 focus-within:border-slate-400 transition-all">
                         <Lock className="w-4 h-4 text-slate-400" />
                         <input 
+                          ref={confirmPasswordRef}
                           type={showConfirmPassword ? "text" : "password"} 
                           value={confirmPassword}
                           onChange={e => setConfirmPassword(e.target.value)}
-                          onKeyDown={e => e.key === 'Enter' && handleLogin()}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              handleLogin();
+                            }
+                          }}
                           placeholder="请再次输入密码" 
                           className="bg-transparent border-none outline-none text-sm text-slate-700 w-full" 
                         />
@@ -1728,14 +2653,13 @@ export default function Home() {
                   )}
                 </div>
 
-                <motion.button 
-                  whileHover={{ scale: 1.02, y: -2 }}
-                  whileTap={{ scale: 0.98 }}
+                <button
                   onClick={handleLogin}
-                  className="w-full mt-8 py-4 rounded-2xl bg-slate-800 text-white font-semibold shadow-lg shadow-slate-200 hover:bg-slate-700 transition-all"
+                  disabled={isLoading}
+                  className="w-full mt-8 py-4 rounded-2xl bg-slate-800 text-white font-semibold shadow-lg shadow-slate-200 hover:bg-slate-700 transition-all disabled:opacity-70 disabled:cursor-not-allowed"
                 >
-                  {authMode === 'login' ? '立即登录' : '立即注册'}
-                </motion.button>
+                  {isLoading ? '提交中...' : (authMode === 'login' ? '立即登录' : '立即注册')}
+                </button>
 
                 <div className="mt-6 text-center">
                   <button 
@@ -1765,7 +2689,7 @@ export default function Home() {
                 initial={{ opacity: 0, scale: 0.9, y: 20 }}
                 animate={{ opacity: 1, scale: 1, y: 0 }}
                 exit={{ opacity: 0, scale: 0.9, y: 20 }}
-                className="relative glass-pill bg-white/90 backdrop-blur-2xl p-8 rounded-[2.5rem] border border-white shadow-2xl w-full max-w-2xl pointer-events-auto overflow-hidden"
+                className="relative glass-pill bg-white/90 backdrop-blur-2xl p-8 rounded-[2.5rem] border border-white shadow-2xl w-full max-w-2xl pointer-events-auto overflow-hidden ui-interactive"
                 onClick={e => e.stopPropagation()}
               >
                 <div className="flex items-center justify-between mb-8">
@@ -1920,11 +2844,17 @@ export default function Home() {
   );
 }
 
-function Marker({ x, y, color, label, onClick, isEditing, isHighlighted }: { x: number, y: number, color: string, label: string, onClick?: () => void, isEditing?: boolean, isHighlighted?: boolean }) {
+function Marker({ x, y, color, label, onClick, isEditing, isHighlighted, onMouseDown }: { x: number, y: number, color: string, label: string, onClick?: () => void, isEditing?: boolean, isHighlighted?: boolean, onMouseDown?: (e: React.MouseEvent) => void }) {
   return (
-    <motion.g initial={{ opacity: 0, scale: 0 }} animate={{ opacity: isEditing ? 0.3 : 1, scale: 1 }} exit={{ opacity: 0, scale: 0 }} whileHover={isEditing ? {} : "hover"} className="pointer-events-auto cursor-pointer" onClick={(e) => { if (onClick) { e.stopPropagation(); onClick(); } }}>
-      <circle cx={x} cy={y} r="12" fill={color} opacity="0.15" filter="url(#glow-lg)" />
-      
+    <motion.g 
+      initial={{ opacity: 0, scale: 0 }} 
+      animate={{ opacity: isEditing ? 0.3 : 1, scale: 1 }} 
+      exit={{ opacity: 0, scale: 0 }} 
+      whileHover={isEditing ? {} : "hover"} 
+      className="pointer-events-auto cursor-pointer draggable-element" 
+      onClick={(e) => { if (onClick) { e.stopPropagation(); onClick(); } }}
+      onMouseDown={(e) => { if (onMouseDown) onMouseDown(e); }}
+    >
       {/* Highlight effect */}
        <AnimatePresence>
          {isHighlighted && (
@@ -1962,8 +2892,23 @@ function Marker({ x, y, color, label, onClick, isEditing, isHighlighted }: { x: 
            </>
          )}
        </AnimatePresence>
-
-      <motion.circle cx={x} cy={y} r="7" fill="white" stroke={color} strokeWidth="3" filter="url(#glow-sm)" variants={{ hover: { scale: 1.3 } }} transition={{ type: "spring", stiffness: 300, damping: 20 }} animate={isHighlighted ? { scale: [1, 1.5, 1] } : {}} style={{ transformOrigin: `${x}px ${y}px` }} />
+      <motion.text
+        x={x}
+        y={y}
+        fontSize="26"
+        textAnchor="middle"
+        dominantBaseline="central"
+        className="select-none"
+        style={{
+          filter: "drop-shadow(0 6px 6px rgba(15, 23, 42, 0.2))",
+          transformOrigin: `${x}px ${y}px`,
+        }}
+        variants={{ hover: { scale: 1.2 } }}
+        transition={{ type: "spring", stiffness: 300, damping: 20 }}
+        animate={isHighlighted ? { scale: [1, 1.18, 1] } : {}}
+      >
+        📍
+      </motion.text>
       <foreignObject x={x - 60} y={y + 20} width="120" height="60"><div className="flex justify-center p-1"><motion.div variants={{ hover: { y: 2, scale: 1.05 } }} animate={isHighlighted ? { scale: [1, 1.1, 1], y: [0, -5, 0] } : {}} className="glass-pill px-3 py-1.5 rounded-xl text-[11px] font-medium text-slate-700 whitespace-nowrap shadow-sm border border-white/60">{label}</motion.div></div></foreignObject>
     </motion.g>
   );
